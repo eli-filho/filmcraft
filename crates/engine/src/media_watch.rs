@@ -51,6 +51,7 @@ fn stamp(_: &str) -> Option<Stamp> {
 pub fn media_files(p: &Project, pool: &MediaPool) -> BTreeMap<String, String> {
     p.items
         .values()
+        .filter(|item| !p.pending_imports.contains_key(&item.id))
         .filter_map(|i| match &i.kind {
             ItemKind::Media(m) if !m.offline => match &m.media {
                 MediaRef::File { path } => Some((path.clone(), pool.follow(path).ok()?)),
@@ -64,7 +65,9 @@ pub fn media_files(p: &Project, pool: &MediaPool) -> BTreeMap<String, String> {
 /// Whether `p` has a file media item to watch (made-offline ones aside): the interface's check on
 /// every frame, which stops at the first one ([`media_files`] lists them all).
 pub fn has_media_files(p: &Project) -> bool {
-    p.items.values().any(|i| matches!(&i.kind, ItemKind::Media(m) if !m.offline && matches!(m.media, MediaRef::File { .. })))
+    p.items
+        .values()
+        .any(|i| !p.pending_imports.contains_key(&i.id) && matches!(&i.kind, ItemKind::Media(m) if !m.offline && matches!(m.media, MediaRef::File { .. })))
 }
 
 /// `media.refreshChanged`: stamp the project's media files now and read the changed ones again.
@@ -126,6 +129,9 @@ impl Session {
         let mut fresh = Vec::new();
         let mut failed = BTreeSet::new();
         for (id, it) in &self.project.items {
+            if self.project.pending_imports.contains_key(id) {
+                continue;
+            }
             let Some(m) = it.as_media().filter(|m| !m.offline) else { continue };
             let MediaRef::File { path } = &m.media else { continue };
             if !changed.contains(path) || failed.contains(path) {

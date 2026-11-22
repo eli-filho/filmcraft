@@ -87,6 +87,11 @@ impl FilmcraftApp {
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 filmcraft_engine::media_pool::media_key(m).hash(&mut h);
                 (m.proxy.is_some() && self.session.media.use_proxies()).hash(&mut h);
+                // A pending import keeps the same path and item identity when its metadata arrives.
+                // Invalidate any interim source image without invalidating it for unrelated edits.
+                (m.info.duration, m.info.file_size).hash(&mut h);
+                m.info.video.as_ref().map(|v| (v.width, v.height, v.frame_rate)).hash(&mut h);
+                self.session.import_status(target).is_some_and(|status| !status.ready).hash(&mut h);
                 h.finish()
             }
             _ => self.session.revision,
@@ -94,6 +99,9 @@ impl FilmcraftApp {
     }
 
     pub fn thumbnail(&mut self, ctx: &egui::Context, item: filmcraft_project::ItemId, t: Tick, width: u32) -> Option<(egui::TextureId, egui::Vec2)> {
+        if self.session.import_status_at(item, t).is_some_and(|status| !status.ready) {
+            return None;
+        }
         let pi = self.session.project.item(item)?;
         let src_w = match &pi.kind {
             filmcraft_project::ItemKind::Media(m) => m.info.video.as_ref()?.width,

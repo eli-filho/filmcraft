@@ -221,6 +221,31 @@ impl FilmcraftApp {
             return;
         }
         let now = self.now();
+        if let Some(status) = self.session.state.active_sequence.and_then(|item| self.session.import_status_at(item, self.session.playhead()))
+            && !status.ready
+        {
+            if let Some(error) = status.error {
+                self.stop();
+                self.ui.status = error;
+                return;
+            }
+            // Waiting for media must not consume the temporary clip's duration or time out into
+            // silent playback. The editor stays live; the normal preroll restarts when it is ready.
+            if self.playback.audio_clock
+                && let Some(audio) = self.audio.as_mut()
+            {
+                audio.stop();
+            }
+            self.playback.audio_clock = false;
+            self.playback.audio_retry_at = 0.0;
+            self.playback.anchor_tick = self.session.playhead();
+            self.playback.anchor_time = now;
+            self.playback.smooth_playhead = None;
+            self.playback.preroll = Some(-1.0);
+            self.playback.preroll_ready = false;
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
         if let Some(since) = self.playback.preroll {
             let since = if since < 0.0 { now } else { since };
             self.playback.preroll = Some(since);

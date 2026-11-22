@@ -504,6 +504,7 @@ fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportS
 
 /// Run an export of `seq` in `project` as a background job (or now, with `wait`); returns the job id.
 pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
+    require_prepared_export_media(&project, seq, &settings)?;
     let format = settings.format;
     if !filmcraft_export::available(format) {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));
@@ -548,6 +549,61 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         std::thread::Builder::new().name("filmcraft-export".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
     }
     Ok(id)
+}
+
+/// A queued export owns a project snapshot: later import completion cannot hydrate that snapshot.
+/// Refuse its unfinished dependencies before creating output directories or caption sidecars;
+/// otherwise non-stepped audio exporters can turn an unreadable pending source into silence.
+fn require_prepared_export_media(project: &Project, sequence: ItemId, settings: &ExportSettings) -> Result<()> {
+    if project.pending_imports.is_empty() {
+        return Ok(());
+    }
+    let range = filmcraft_export::export_range(project, sequence, settings).map_err(|error| EngineError::Other(error.to_string()))?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut todo = vec![sequence];
+    while let Some(item) = todo.pop() {
+        if !seen.insert(item) {
+            continue;
+        }
+        if seen.len() > 4096 {
+            return Err(EngineError::Other("export media dependency limit exceeded".into()));
+        }
+        if let Some(pending) = project.pending_imports.get(&item) {
+            let reason = pending.error.as_deref().unwrap_or("media preparation is still running");
+            return Err(EngineError::Other(format!("Cannot export {}: {reason}. Finish or retry importing this media, then export again.", pending.path)));
+        }
+        match project.item(item).map(|item| &item.kind) {
+            Some(filmcraft_project::ItemKind::Subclip { parent, .. }) => todo.push(*parent),
+            Some(filmcraft_project::ItemKind::Sequence(nested)) => {
+                for track in nested.all_tracks().filter(|track| track.enabled && !track.muted) {
+                    let included = match track.kind {
+                        filmcraft_project::TrackKind::Video => settings.has_video(),
+                        filmcraft_project::TrackKind::Audio => settings.has_audio(),
+                    };
+                    if included {
+                        for clip in track.items.iter().filter(|clip| clip.enabled) {
+                            // Only the top-level selected interval is rendered. Include transition
+                            // handles too: they can read a clip just outside its ordinary span.
+                            if item == sequence
+                                && !clip.range().overlaps(&range)
+                                && !track.transitions.iter().any(|transition| {
+                                    (transition.from == Some(clip.id) || transition.to == Some(clip.id)) && transition.range().overlaps(&range)
+                                })
+                            {
+                                continue;
+                            }
+                            if todo.len() >= 4096 {
+                                return Err(EngineError::Other("export media dependency limit exceeded".into()));
+                            }
+                            todo.push(clip.item);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Last-resort guard for a background job body (export, previews, proxies, …): a panic marks the

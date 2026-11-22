@@ -122,7 +122,7 @@ impl FilmcraftApp {
         self.auto.add("status.text", shown.rect, &hint);
     }
 
-    /// The running job (export / render previews), if any; plays the rendered range when a preview
+    /// The running job, if any; plays the rendered range when a preview
     /// render completes. Runs every frame, with or without the status bar.
     pub(super) fn poll_jobs(&mut self, ctx: &egui::Context) -> Option<filmcraft_engine::Job> {
         use std::sync::atomic::Ordering;
@@ -154,7 +154,7 @@ impl FilmcraftApp {
         self.session.jobs.iter().rev().find(|j| !j.progress.finished.load(Ordering::Relaxed)).cloned()
     }
 
-    /// Right side of the status bar: the running job (export / render previews) with a progress
+    /// Right side of the status bar: the running job with a progress
     /// bar and a cancel button. Returns where it starts, if a job is running.
     fn job_status(&mut self, ui: &mut egui::Ui, sb: egui::Rect, t: &Tokens) -> Option<f32> {
         use std::sync::atomic::Ordering;
@@ -171,7 +171,11 @@ impl FilmcraftApp {
         let shown = match self.job_text.take().filter(|s| s.job == job.id) {
             Some(s) if (s.at..s.at + panels::JobText::EVERY).contains(&now) => s,
             old => {
-                let verb = if job.label.starts_with("Rendering") { crate::i18n::t(&job.label).to_string() } else { tl!("Exporting").to_string() };
+                let verb = match job.label.as_str() {
+                    "Removing Background" => tl!("Removing Background"),
+                    label if label.starts_with("Rendering") => crate::i18n::t(label),
+                    _ => tl!("Exporting"),
+                };
                 let label = format!("{:.0}%{}", f * 100.0, eta.map(panels::left_text).unwrap_or_default());
                 let text = format!("{verb}… {label}");
                 // room from the start for 100 % and the longest time shown (99:59:59), so no estimate

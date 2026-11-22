@@ -16,6 +16,7 @@ pub mod digits;
 pub mod dpx;
 pub mod generators;
 pub mod pending;
+pub mod person_matte;
 pub mod reader;
 pub mod sequence;
 pub mod still;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 
 use filmcraft_color::ColorInfo;
 use filmcraft_frame::{AudioBuffer, VideoFrame};
-use filmcraft_time::{FrameRate, Tick};
+use filmcraft_time::{FrameRate, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 
 pub use cache::FrameCache;
@@ -52,6 +53,14 @@ pub enum MediaError {
 }
 
 pub type Result<T> = std::result::Result<T, MediaError>;
+
+/// Preparation state of a source whose initial media is usable before all of it is ready.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MediaReadiness {
+    Ready,
+    Loading { available: Tick, total: Tick },
+    Failed(String),
+}
 
 /// Up to 384 kHz audio (surpassing professional 192 kHz formats).
 pub const MAX_AUDIO_SAMPLE_RATE: u32 = 384_000;
@@ -215,6 +224,11 @@ impl FrameRequest {
 
 pub trait MediaSource: Send + Sync {
     fn info(&self) -> &MediaInfo;
+    /// Most sources decode on demand and are ready immediately. Progressive sources report
+    /// their prepared prefix here so callers can retry pending reads and surface later failures.
+    fn readiness(&self) -> MediaReadiness {
+        MediaReadiness::Ready
+    }
     /// The frame displayed at media time `req.time`.
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
     /// Like [`video_frame`](Self::video_frame), but a source may leave the container's display
@@ -222,6 +236,24 @@ pub trait MediaSource: Send + Sync {
     /// to it (0: upright, as `video_frame` returns it).
     fn video_frame_unturned(&self, req: FrameRequest) -> Result<(Arc<VideoFrame>, u8)> {
         self.video_frame(req).map(|f| (f, 0))
+    }
+    /// The source pictures in presentation order, identified by container frame keys. Some
+    /// sources do not expose their exact picture timestamps and cannot be analysed for mattes.
+    fn matte_frame_keys(&self, _limit: usize) -> Result<Vec<i64>> {
+        Err(MediaError::Unsupported("Remove Background requires a supported MP4, MOV or Matroska video".into()))
+    }
+    /// Original presentation keys in a half-open media-time range, including the frame displayed
+    /// at its start. Sources without exact range selection return their full frame schedule.
+    fn matte_frame_keys_in_range(&self, _range: TimeRange, limit: usize) -> Result<Vec<i64>> {
+        self.matte_frame_keys(limit)
+    }
+    /// Decode the upright source picture for one key returned by `matte_frame_keys`.
+    fn matte_frame(&self, _key: i64) -> Result<Arc<VideoFrame>> {
+        Err(MediaError::Unsupported("the source has no indexed matte frames".into()))
+    }
+    /// The key of the picture `video_frame` selects for this request time.
+    fn matte_frame_key(&self, _time: Tick) -> Option<i64> {
+        None
     }
     /// `frames` audio frames starting at sample index `start` (at `sample_rate`, media time).
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer>;

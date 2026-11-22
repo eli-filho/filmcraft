@@ -35,7 +35,7 @@ use filmcraft_media::{Generator, MediaInfo};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 
-pub use caption::{Caption, CaptionAlign, CaptionAnchor, CaptionFormat, CaptionStyle, CaptionTrack, plain_text};
+pub use caption::{Caption, CaptionAlign, CaptionAnchor, CaptionBackgroundMode, CaptionFormat, CaptionPosition, CaptionStyle, CaptionTrack, plain_text};
 pub use effect::{EffectDef, EffectInstance, EffectKind, ParamDef, ParamKind, effect_defs, find_effect, interchange_name, search_aliases};
 pub use essential::{AudioType, EssentialSound};
 pub use find::{FindOp, FindQuery, FindRow, SearchBin};
@@ -73,7 +73,8 @@ pub use sequence::{
 pub use settings::{IngestAction, IngestSettings, ProjectSettings, ScratchDisks};
 pub use source::resolve_auto_points;
 pub use track::{
-    AudioChannels, FieldOptions, FieldProcessing, Marker, MarkerKind, TimeInterpolation, Track, TrackItem, TrackKind, Transition, TransitionAlign,
+    AudioChannels, FieldOptions, FieldProcessing, Marker, MarkerKind, PersonMatteRef, TimeInterpolation, Track, TrackItem, TrackKind, Transition,
+    TransitionAlign,
 };
 pub use view::{MAX_LUT_TEXT_BYTES, ProjectLut, ProjectView, SequenceView};
 id_type!(ItemId);
@@ -86,6 +87,10 @@ id_type!(MarkerId);
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
+    /// Accepted media still being prepared. Persisted so saving or recovering during an import
+    /// keeps the editable clips and resumes preparation instead of losing the drop.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_imports: BTreeMap<ItemId, PendingImport>,
     /// Custom marker/clip swatches saved only with this project (schema v16).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_colors: Vec<HexColor>,
@@ -122,6 +127,27 @@ pub struct Project {
     pub notes: String,
 }
 
+/// Stable identity of an accepted file whose metadata is not final yet. Preparation never
+/// replaces track items: edits already refer to the ordinary project item and clip identities.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingImport {
+    pub ticket: u64,
+    #[serde(default)]
+    pub batch: u64,
+    pub path: String,
+    pub provisional_duration: Tick,
+    #[serde(default)]
+    pub scaling: String,
+    /// Initial placements in this import batch. Automatic duration discovery may carry an
+    /// untouched adjacent pending clip, but must never move one the editor repositioned.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placements: BTreeMap<ClipId, (ItemId, TrackId, Tick)>,
+    #[serde(default)]
+    pub metadata_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl Default for Project {
     fn default() -> Self {
         Self::new("Untitled")
@@ -137,6 +163,7 @@ impl Project {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.into(),
+            pending_imports: BTreeMap::new(),
             custom_colors: Vec::new(),
             custom_color_names: BTreeMap::new(),
             settings: ProjectSettings::default(),
@@ -495,6 +522,7 @@ impl Project {
             source_channels,
             audio_stream: 0,
             graphic: source_graphic.and_then(|sg| sg.meta.map(Box::new)),
+            person_matte: None,
         })
     }
 

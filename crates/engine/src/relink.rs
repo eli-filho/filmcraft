@@ -110,6 +110,10 @@ pub fn scan(p: &Project, pool: &MediaPool, services: &dyn Services) -> Vec<Missi
         let MediaRef::File { path } = &m.media else { continue };
         let status = if m.offline {
             "offline"
+        } else if let Some(pending) = p.pending_imports.get(&it.id) {
+            // Opening a saved project must not synchronously inspect an unfinished import.
+            // Failed imports remain available in Link Media without retrying the slow path.
+            if pending.error.is_some() { "missing" } else { continue }
         } else if !exists(path) {
             "missing"
         } else if let Some(MediaRef::File { path: pp }) = &m.proxy
@@ -610,9 +614,12 @@ fn status_json(s: &Session, id: ItemId) -> Option<Value> {
         MediaRef::File { path } => Some(path.clone()),
         MediaRef::Generator(_) => None,
     };
+    let preparation = s.import_status(id);
     let status = match &path {
         None => "generated",
         Some(_) if m.offline => "offline",
+        Some(_) if preparation.as_ref().is_some_and(|p| p.error.is_some()) => "unreadable",
+        Some(_) if preparation.is_some() => "preparing",
         Some(p) if s.media.follow(p).ok().is_none_or(|file| s.services.file_size(&file).is_err()) => "missing",
         Some(_) => match s.media.offline_status(id) {
             Some(o) if o.reason == filmcraft_render::offline::OfflineReason::Unreadable => "unreadable",
@@ -620,7 +627,9 @@ fn status_json(s: &Session, id: ItemId) -> Option<Value> {
         },
     };
     let proxy = match &m.proxy {
-        Some(MediaRef::File { path }) => json!({"path": path, "online": s.media.follow(path).is_ok_and(|file| s.services.file_size(&file).is_ok())}),
+        Some(MediaRef::File { path }) if preparation.is_none() => {
+            json!({"path": path, "online": s.media.follow(path).is_ok_and(|file| s.services.file_size(&file).is_ok())})
+        }
         _ => Value::Null,
     };
     Some(json!({
@@ -630,6 +639,7 @@ fn status_json(s: &Session, id: ItemId) -> Option<Value> {
         "status": status,
         "identity": m.identity,
         "proxy": proxy,
+        "preparation": preparation,
     }))
 }
 

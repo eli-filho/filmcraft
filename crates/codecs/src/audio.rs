@@ -19,6 +19,10 @@ use crate::{CodecError, Result};
 #[path = "audio_panic_tests.rs"]
 mod panic_tests;
 
+#[path = "audio_progressive.rs"]
+mod progressive;
+pub use progressive::open_progressive_audio;
+
 /// A decoder that unwound may have partially changed its state. Keep it quarantined, including
 /// across seeks, until its owner creates a fresh decoder. Ordinary decode errors remain retryable.
 struct SymphoniaDecoder {
@@ -1441,7 +1445,7 @@ mod gapless_tests {
 
     /// Silent mono 44.1 kHz 128 kbps MPEG-1 layer III file: an Info frame carrying a LAME tag with
     /// an encoder delay of 576 samples and no padding, then ten frames of silence.
-    fn tagged_mp3() -> Vec<u8> {
+    pub(super) fn tagged_mp3() -> Vec<u8> {
         let header = [0xFF, 0xFB, 0x90, 0xC0];
         let mut info = vec![0u8; FRAME_LEN];
         info[..4].copy_from_slice(&header);

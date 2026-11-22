@@ -24,6 +24,7 @@ pub mod lumetri_cube;
 pub mod lumetri_presets;
 pub mod luts;
 pub mod mask;
+mod matte;
 pub mod mixer;
 pub mod multicam;
 pub mod offline;
@@ -40,8 +41,9 @@ use std::sync::Arc;
 
 use filmcraft_frame::{PixelData, VideoFrame, pool};
 use filmcraft_geom::{Affine, Vec2};
+use filmcraft_media::person_matte::{MatteFrame, MatteReader};
 use filmcraft_media::{FrameRequest, SharedSource};
-use filmcraft_project::{ItemId, ItemKind, ParamValue, Project, Sequence, TrackItem};
+use filmcraft_project::{ItemId, ItemKind, ParamValue, PersonMatteRef, Project, Sequence, TrackItem};
 use filmcraft_time::{Tick, TimeDisplay, format_time};
 
 pub use blend::Blend;
@@ -50,6 +52,25 @@ pub use image::Image;
 /// Resolves project items to media sources (the engine owns the media pool).
 pub trait SourceProvider: Sync {
     fn source(&self, item: ItemId) -> Option<SharedSource>;
+
+    /// Resolve a saved matte ID in the application's local cache.
+    fn person_matte(&self, _item: ItemId, _reference: &PersonMatteRef) -> Option<MatteReader> {
+        None
+    }
+
+    /// The original source for a matte clip. Proxies can have different presentation keys.
+    fn matte_source(&self, item: ItemId) -> Option<SharedSource> {
+        self.source(item)
+    }
+
+    /// A preview can fall back to the original picture. An export provider can capture this
+    /// failure so it can stop before writing a frame without the requested cutout.
+    fn person_matte_failed(&self, _item: ItemId) {}
+
+    /// Error that prevents this provider from delivering a correct video frame.
+    fn video_error(&self) -> Option<String> {
+        None
+    }
 }
 
 impl<F: Fn(ItemId) -> Option<SharedSource> + Sync> SourceProvider for F {
@@ -571,26 +592,29 @@ pub(crate) fn item_layer_ex(
     // plain media: nothing but the frame itself reaches the output
     let plain_media = matches!(pi.kind, ItemKind::Media(_) | ItemKind::Subclip { .. })
         && !(opts.effects && item.has_standard_effects())
+        && item.active_person_matte().is_none()
         && !item.effect("opacity").is_some_and(|e| e.enabled && !e.masks.is_empty());
     let mut fetched = None;
     if allow_region && plain_media {
-        let (src, frame, n) = media_frame(item, t, sources, want, src_size)?;
+        let media = media_frame(item, t, sources.source(item.item)?, want, src_size, None)?;
+        let MediaFrame { src, frame, n, .. } = &media;
+        let n = *n;
         let (lw, lh) = frame.decimated_size(n);
         let px_scale = lw as f32 / src_size.0.max(1) as f32;
         let m =
             Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
-        if (lw, lh) == (w, h) && identity_placement(&m) && media_interpolation(item, t, &src, seq.settings.frame_rate).is_none() {
-            let cs = colorman::source_space(project, item.item, &frame);
-            if !colorman::needs_management(&seq.settings.color, cs, &frame) {
+        if (lw, lh) == (w, h) && identity_placement(&m) && media_interpolation(item, t, src, seq.settings.frame_rate).is_none() {
+            let cs = colorman::source_space(project, item.item, frame);
+            if !colorman::needs_management(&seq.settings.color, cs, frame) {
                 let (op, bl) = opacity_blend(item, mt);
-                return Some(plain_layer(&frame, n, op, bl));
+                return Some(plain_layer(frame, n, op, bl));
             }
         }
         // anything else takes the general path below, with the frame already fetched
-        fetched = Some((src, frame, n));
+        fetched = Some(media);
     }
     let mut layer = match fetched {
-        Some((src, frame, n)) => media_image(project, seq, item, t, MediaFrame { src: &src, frame: &frame, n }, want),
+        Some(media) => media_image(project, seq, item, t, media, want, None),
         None => base_layer(project, seq, item, t, opts, sources, want)?,
     };
     let px_scale = layer.w as f32 / src_size.0.max(1) as f32;
@@ -650,11 +674,11 @@ fn plain_layer(frame: &Arc<VideoFrame>, n: usize, opacity: f32, blend: Blend) ->
 
 /// The source frame of a media clip at timeline `t` (at `want` of its size), and the decimation to
 /// convert it with.
-fn media_frame(item: &TrackItem, t: Tick, sources: &dyn SourceProvider, want: f32, src_size: (u32, u32)) -> Option<(SharedSource, Arc<VideoFrame>, usize)> {
-    let src = sources.source(item.item)?;
-    let frame = src.video_frame(FrameRequest { time: video_source_time(item, t, src.info().frame_rate()), scale: want }).ok()?;
+fn media_frame(item: &TrackItem, t: Tick, src: SharedSource, want: f32, src_size: (u32, u32), matte: Option<&MatteContext<'_>>) -> Option<MediaFrame> {
+    let req = FrameRequest { time: video_source_time(item, t, src.info().frame_rate()), scale: want };
+    let (frame, coverage) = fetch_frame(&src, req, matte)?;
     let n = decimation(frame.width as f32, src_size.0 as f32 * want);
-    Some((src, frame, n))
+    Some(MediaFrame { src, frame, n, coverage })
 }
 
 /// The media time to ask a source for the video frame a clip shows at timeline `t`. A reversed
@@ -662,7 +686,7 @@ fn media_frame(item: &TrackItem, t: Tick, sources: &dyn SourceProvider, want: f3
 /// request to the nearest unit of a coarse timescale (MP4) land on the next frame from there,
 /// showing one frame past the clip's source range and never its In (#318). Snapped down to the
 /// start of the `media_rate` frame that contains it, every reader shows that frame.
-pub(crate) fn video_source_time(item: &TrackItem, t: Tick, media_rate: filmcraft_time::FrameRate) -> Tick {
+pub fn video_source_time(item: &TrackItem, t: Tick, media_rate: filmcraft_time::FrameRate) -> Tick {
     let ft = item.source_time_at(t);
     if !item.reverse || item.frame_hold.is_some() || media_rate.frame_duration().0 <= 0 {
         return ft;
@@ -670,23 +694,66 @@ pub(crate) fn video_source_time(item: &TrackItem, t: Tick, media_rate: filmcraft
     media_rate.tick_of(media_rate.frame_at(ft)).clamp(item.source_in.min(ft), ft)
 }
 
-/// A decoded media frame with the source it came from and its decode index.
-#[derive(Clone, Copy)]
-struct MediaFrame<'a> {
-    src: &'a SharedSource,
-    frame: &'a VideoFrame,
+struct MatteContext<'a> {
+    reader: MatteReader,
+    sources: &'a dyn SourceProvider,
+    item: ItemId,
+}
+
+fn open_matte<'a>(project: &Project, item: &TrackItem, sources: &'a dyn SourceProvider) -> Option<(MatteContext<'a>, SharedSource)> {
+    let reference = item.active_person_matte()?;
+    let same_source = project.resolve_media(item.item).is_some_and(|(_, media, _)| !media.offline && media.identity == Some(reference.source));
+    if same_source
+        && let Some(reader) = sources.person_matte(item.item, reference)
+        && let Some(source) = sources.matte_source(item.item)
+    {
+        return Some((MatteContext { reader, sources, item: item.item }, source));
+    }
+    sources.person_matte_failed(item.item);
+    None
+}
+
+fn fetch_frame(src: &SharedSource, req: FrameRequest, matte: Option<&MatteContext<'_>>) -> Option<(Arc<VideoFrame>, Option<MatteFrame>)> {
+    if let Some(matte) = matte {
+        // Ask for the exact frame used in analysis, even in a playback catch-up pass. Using
+        // nominal frame numbers or a neighbouring decoded frame can misalign a VFR cutout.
+        if let Some(key) = src.matte_frame_key(req.time)
+            && let Ok(Some(coverage)) = matte.reader.frame(key)
+            && let Ok(frame) = src.matte_frame(key)
+        {
+            return Some((frame, Some(coverage)));
+        }
+        if !filmcraft_media::cancel::cancelled() {
+            matte.sources.person_matte_failed(matte.item);
+        }
+    }
+    src.video_frame(req).ok().map(|frame| (frame, None))
+}
+
+/// A decoded media frame, its coverage and the decimation to apply to the image.
+struct MediaFrame {
+    src: SharedSource,
+    frame: Arc<VideoFrame>,
     n: usize,
+    coverage: Option<MatteFrame>,
 }
 
 /// The linear image of a media clip's `frame`, colour managed, and blended (or, with Optical Flow,
 /// motion interpolated) with the next frame when the clip's speed asks for it.
-fn media_image(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, mf: MediaFrame<'_>, want: f32) -> Image {
-    let MediaFrame { src, frame, n } = mf;
-    let img = colorman::decode(project, item.item, frame, n, &seq.settings.color);
-    match media_interpolation(item, t, src, seq.settings.frame_rate) {
-        Some((next_time, wgt)) => match src.video_frame(FrameRequest { time: next_time, scale: want }) {
-            Ok(f2) if f2.width == frame.width && f2.height == frame.height => {
-                let b = colorman::decode(project, item.item, &f2, n, &seq.settings.color);
+fn media_image(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, mf: MediaFrame, want: f32, matte: Option<&MatteContext<'_>>) -> Image {
+    let MediaFrame { src, frame, n, coverage } = mf;
+    let decode = |frame: &VideoFrame, coverage: Option<MatteFrame>| {
+        let mut img = colorman::decode(project, item.item, frame, n, &seq.settings.color);
+        if let Some(coverage) = coverage {
+            matte::apply(&mut img, &coverage);
+        }
+        img
+    };
+    let img = decode(&frame, coverage);
+    match media_interpolation(item, t, &src, seq.settings.frame_rate) {
+        Some((next_time, wgt)) => match fetch_frame(&src, FrameRequest { time: next_time, scale: want }, matte) {
+            Some((f2, coverage)) if f2.width == frame.width && f2.height == frame.height => {
+                let b = decode(&f2, coverage);
                 if item.time_interpolation == filmcraft_project::TimeInterpolation::OpticalFlow { flow::interpolate(&img, &b, wgt) } else { img.lerp(&b, wgt) }
             }
             _ => img,
@@ -713,8 +780,12 @@ pub(crate) fn base_layer(
     let pi = project.item(item.item)?;
     Some(match &pi.kind {
         ItemKind::Media(_) | ItemKind::Subclip { .. } => {
-            let (src, frame, n) = media_frame(item, t, sources, want, src_size)?;
-            media_image(project, seq, item, t, MediaFrame { src: &src, frame: &frame, n }, want)
+            let (matte, src) = match open_matte(project, item, sources) {
+                Some((matte, src)) => (Some(matte), src),
+                None => (None, sources.source(item.item)?),
+            };
+            let media = media_frame(item, t, src, want, src_size, matte.as_ref())?;
+            media_image(project, seq, item, t, media, want, matte.as_ref())
         }
         ItemKind::Sequence(nested) => {
             let sub = RenderOptions { scale: want, effects: opts.effects, depth: opts.depth + 1, captions: false, working_output: true };

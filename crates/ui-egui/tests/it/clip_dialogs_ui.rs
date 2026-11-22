@@ -2,11 +2,12 @@
 //! Subclip, Frame Hold Options, Modify ▸ Audio Channels, the Close Project prompt, and nested
 //! menus (Clip ▸ Video Options ▸ Time Interpolation).
 
+use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 
 use egui_kittest::Harness;
 use filmcraft_engine::Session;
-use filmcraft_engine::project::{ItemKind, Label};
+use filmcraft_engine::project::{ItemKind, Label, MediaIdentity, PersonMatteRef};
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
 use serde_json::{Value, json};
@@ -425,6 +426,55 @@ fn scene_edit_detection_from_the_clip_menu_opens_the_dialog() {
     }
     d.click("sceneDetect.cancel");
     assert!(!d.has("sceneDetect.ok"));
+}
+
+#[test]
+fn background_commands_are_discoverable_in_the_clip_context_menu() {
+    let mut d = Driver::new();
+    let clip = d.v1(0);
+    d.ok("ui.click", json!({"id": format!("timeline.clip.{}", clip.id.0), "button": "right"}));
+    d.frames(3);
+    assert!(d.has("timeline.clipMenu.clip.removeBackground"));
+    assert!(d.has("timeline.clipMenu.clip.restoreBackground"));
+}
+
+#[test]
+fn opacity_header_offers_background_removal_for_the_selected_video_clip() {
+    let mut d = Driver::new();
+    d.ok("ui.panel.show", json!({"panel": "Effect Controls"}));
+    d.frames(3);
+    let id = "effectControls.opacity.removeBackground";
+    assert!(!d.has(id));
+    let clip = d.v1(0);
+    d.exec("timeline.select", json!({"clips": [clip.id.0]}));
+    d.frames(3);
+    let items = d.ok("ui.elements", json!({"prefix": id}));
+    let button = &items[0];
+    assert_eq!(button["label"], "Remove Background");
+    assert_eq!(button["enabled"], true);
+    assert_eq!(button["focusable"], true);
+    assert!(button["widgetId"].is_string());
+}
+
+#[test]
+fn opacity_header_toggles_analyzed_background_without_removing_the_matte() {
+    let mut d = Driver::new();
+    let clip = d.v1(0);
+    let session = &mut d.app().session;
+    let seq = session.state.active_sequence.unwrap();
+    let q = Arc::make_mut(&mut session.project).sequence_mut(seq).unwrap();
+    let matte = PersonMatteRef { cache_id: "fixture".into(), source: MediaIdentity { size: 0, fingerprint: 0 }, bypassed: false };
+    q.video_tracks[0].item_mut(clip.id).unwrap().person_matte = Some(matte.clone());
+    d.exec("timeline.select", json!({"clips": [clip.id.0]}));
+    d.ok("ui.panel.show", json!({"panel": "Effect Controls"}));
+    d.frames(3);
+    let toggle = "effectControls.opacity.toggleBackgroundRemoval";
+    d.click(toggle);
+    let bypassed = d.v1(0).person_matte.unwrap();
+    assert!(bypassed.bypassed);
+    assert_eq!(bypassed.cache_id, matte.cache_id);
+    d.click(toggle);
+    assert_eq!(d.v1(0).person_matte, Some(matte));
 }
 
 #[test]

@@ -203,6 +203,7 @@ pub(crate) fn auto_transcribe_sequence_clips(s: &mut Session, before: &Project) 
     let items: BTreeSet<_> = audio_placements(&s.project)
         .filter(|placement| !old.contains(placement))
         .filter_map(|(_, _, item)| s.project.resolve_media(item))
+        .filter(|(root, _, _)| !s.project.pending_imports.contains_key(root) && !crate::pending_import::handles_auto_transcription(s, *root))
         .filter(|(root, media, _)| media.info.has_audio() && !s.project.transcripts.contains_key(root))
         .map(|(root, _, _)| root.0)
         .collect();

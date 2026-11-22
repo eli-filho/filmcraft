@@ -115,3 +115,33 @@ fn option_drag_copies_a_caption() {
     d.drag_with(r.center(), r.center() - egui::vec2(r.width() * 0.5, 0.0), 20, Modifiers::NONE);
     assert_eq!(d.captions().len(), 2, "a plain drag does not copy");
 }
+
+#[test]
+fn program_caption_drag_changes_the_tracks_position_without_changing_timing() {
+    let mut d = Driver::demo();
+    let id = d.exec("captions.add", json!({"seconds": 0.0, "durationSeconds": 2.0, "text": "Olá, mundo!"}))["caption"].as_u64().expect("id");
+    d.exec("playhead.set", json!({"seconds": 0.5}));
+    let before = d.captions();
+    let picture = d.rect("program.picture").expect("program picture");
+    let caption_id = format!("program.caption.{id}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let rendered = loop {
+        if let Some(rect) = d.rect(&caption_id) {
+            break rect;
+        }
+        assert!(std::time::Instant::now() < deadline, "caption never appeared in the Program Monitor");
+        std::thread::yield_now();
+    };
+    let to = picture.min + picture.size() * egui::vec2(0.27, 0.38);
+    d.drag_with(rendered.center(), to, 12, Modifiers::NONE);
+    let listed = d.exec("captions.list", json!({}));
+    let pos = &listed["tracks"][0]["style"]["position"];
+    let x = pos["x"].as_f64().expect("drag placed the caption");
+    let y = pos["y"].as_f64().expect("drag placed the caption");
+    assert!((x - 0.27).abs() < 0.025 && (y - 0.38).abs() < 0.025, "drop at {x}, {y}");
+    assert_eq!(d.captions(), before, "positioning must leave cue timing and text intact");
+
+    d.exec("edit.undo", json!({}));
+    let listed = d.exec("captions.list", json!({}));
+    assert!(listed["tracks"][0]["style"]["position"].is_null(), "one undo restores the preset");
+}

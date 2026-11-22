@@ -177,6 +177,11 @@ pub(super) fn source_peaks(src: &dyn filmcraft_media::MediaSource, stream: usize
 
 /// Waveform peaks of audio stream `stream` of `item` (a clip's `audio_stream`).
 pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId, stream: usize) -> Option<Arc<Vec<(f32, f32)>>> {
+    // A source can have a playable prefix while it is still loading. Scanning that prefix here
+    // would cache an incomplete waveform forever under the final item's identity.
+    if app.session.import_status(item).is_some() {
+        return None;
+    }
     if app.session.project.sequence(item).is_some() {
         return request_sequence_peaks(app, item);
     }

@@ -285,6 +285,20 @@ fn register_gpu_frame_renderer() {
     });
 }
 
+fn register_background_removal() {
+    use filmcraft_platform::person_segmentation::{PersonSegmenter, available};
+
+    if available() {
+        filmcraft_engine::background::register(|| {
+            let mut segmenter = PersonSegmenter::new().map_err(|e| e.to_string())?;
+            Ok(Box::new(move |frame| {
+                let matte = segmenter.segment_frame(frame).map_err(|e| e.to_string())?;
+                Ok(filmcraft_engine::background::Matte { width: matte.width, height: matte.height, alpha: matte.alpha })
+            }))
+        });
+    }
+}
+
 fn register_hardware_decoders() -> filmcraft_platform::Availability {
     filmcraft_platform::register()
 }
@@ -319,6 +333,7 @@ async fn cli() {
         return;
     }
     register_hardware_decoders();
+    register_background_removal();
     register_gpu_frame_renderer();
     let Some(cmd) = a.pos(0) else { usage("missing subcommand") };
     match cmd {

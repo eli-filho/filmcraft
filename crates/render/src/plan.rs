@@ -253,7 +253,7 @@ fn simple_transition(id: &str) -> bool {
 /// with effects off). None: the clip is rendered on the CPU.
 fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
-    if !is_media || item.has_opacity_masks() {
+    if !is_media || item.has_opacity_masks() || item.active_person_matte().is_some() {
         return None;
     }
     if !opts.effects {
@@ -372,7 +372,9 @@ pub(crate) fn layered_at(project: &Project, seq: &Sequence, t: Tick, scale: f32,
             if !simple_transition(&trn.effect.effect) && trn.effect.effect != "push" {
                 return false;
             }
-            if [trn.from, trn.to].into_iter().flatten().filter_map(|c| tr.item(c)).any(adjustment) {
+            // A cutout is translucent. Use the reference transition mix so the layer under the
+            // transition is revealed by both sides' coverage, including in a cross dissolve.
+            if [trn.from, trn.to].into_iter().flatten().filter_map(|c| tr.item(c)).any(|it| adjustment(it) || it.active_person_matte().is_some()) {
                 return false;
             }
         }

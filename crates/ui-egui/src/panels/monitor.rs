@@ -20,6 +20,8 @@ use crate::state::{DisplayMode, PlaybackRes};
 use crate::theme::Tokens;
 use crate::widgets::ZoomThumbPart;
 
+mod caption_drag;
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Which {
     Source,
@@ -198,6 +200,35 @@ fn drop_indicator(app: &FilmcraftApp, ui: &mut egui::Ui, video_area: Rect, which
     }
 }
 
+/// Keep transport feedback visible for audio-only sources too, without taking pointer input away
+/// from the monitor's controls or overlays.
+fn import_indicator(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect, target: Target, time: Tick, prefix: &str) {
+    if !(area.width() >= 24.0 && area.height() >= 24.0) {
+        return;
+    }
+    let item = match target {
+        Target::Item(item) | Target::Sequence(item) => item,
+        _ => return,
+    };
+    let Some(status) = app.session.import_status_at(item, time) else { return };
+    if status.ready && status.error.is_none() {
+        return;
+    }
+    let label = status.error.clone().unwrap_or_else(|| super::import_progress::label(&status.label, status.progress));
+    let width = area.width().min(420.0);
+    let box_rect = Rect::from_center_size(area.center(), vec2(width, 58.0)).intersect(area);
+    let painter = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
+    painter.rect_filled(box_rect, 5.0, Color32::from_black_alpha(220));
+    painter.text(box_rect.center() - vec2(0.0, 7.0), Align2::CENTER_CENTER, &label, Tokens::ui(12.0), Color32::WHITE);
+    let bar = Rect::from_min_max(box_rect.left_bottom() + vec2(12.0, -13.0), box_rect.right_bottom() - vec2(12.0, 9.0));
+    let color = if status.error.is_some() { app.tokens.render_yellow } else { app.tokens.accent };
+    super::import_progress::paint(&painter, bar, status.error.as_ref().map(|_| 1.0).or(status.progress), color, ui.input(|i| i.time));
+    app.auto.add(&format!("{prefix}.importProgress"), box_rect, &label);
+    if status.error.is_none() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
 /// The monitor's settings as drawn: cinema mode shows the finished picture, and the saved settings
 /// are back when it ends.
 fn shown_view(saved: &crate::state::MonitorView, cinema: bool) -> crate::state::MonitorView {
@@ -211,6 +242,17 @@ fn shown_view(saved: &crate::state::MonitorView, cinema: bool) -> crate::state::
         mv.show_rulers = false;
     }
     mv
+}
+
+fn multicam_areas(area: Rect, multicam: bool, grid_only: bool) -> (Option<Rect>, Rect) {
+    if grid_only {
+        (Some(area), Rect::from_min_size(area.max, vec2(0.0, 0.0)))
+    } else if multicam {
+        let mid = area.center().x;
+        (Some(Rect::from_min_max(area.min, pos2(mid - 2.0, area.max.y))), Rect::from_min_max(pos2(mid + 2.0, area.min.y), area.max))
+    } else {
+        (None, area)
+    }
 }
 
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which) {
@@ -296,14 +338,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     let multicam = !cinema && which == Which::Program && mv.multicam;
     // without the preview monitor the grid takes the whole picture area
     let grid_only = multicam && !app.session.state.multicam_view.show_preview;
-    let (grid_area, video_area) = if grid_only {
-        (Some(video_area), Rect::from_min_size(video_area.max, vec2(0.0, 0.0)))
-    } else if multicam {
-        let mid = video_area.center().x;
-        (Some(Rect::from_min_max(video_area.min, pos2(mid - 2.0, video_area.max.y))), Rect::from_min_max(pos2(mid + 2.0, video_area.min.y), video_area.max))
-    } else {
-        (None, video_area)
-    };
+    let (grid_area, video_area) = multicam_areas(video_area, multicam, grid_only);
     if let Some(g) = grid_area {
         crate::panels::multicam::grid(app, ui, g);
     }
@@ -374,6 +409,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         );
     }
     drop_indicator(app, ui, video_area, which, &t);
+    let picture_clip = ui.clip_rect();
+    ui.set_clip_rect(saved_clip);
+    import_indicator(app, ui, grid_area.filter(|_| grid_only).unwrap_or(video_area), target, time, prefix);
+    ui.set_clip_rect(picture_clip);
     if cinema {
         ui.set_clip_rect(saved_clip);
         return;
@@ -400,6 +439,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
             crate::panels::masks::monitor_overlay(app, ui, pic, frame_size);
             crate::panels::motion_path::monitor_overlay(app, ui, pic, frame_size);
             crate::panels::transform_handles::monitor_overlay(app, ui, pic, frame_size);
+            if display == DisplayMode::Composite && !multicam {
+                caption_drag::overlay(app, ui, pic, video_area, rate.frame_at(time));
+            }
         }
     }
     if show_picture {

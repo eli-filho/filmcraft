@@ -214,6 +214,114 @@ fn several_files_dropped_together_are_placed_in_one_undo_step() {
     assert_eq!(clip_counts(&h), (0, 0), "one undo removes every placed clip");
 }
 
+/// The reader waits for an explicit release, so acceptance and editing are proved while the
+/// media genuinely cannot finish opening. A synchronous read fails instead of hanging the test.
+struct BlockedImport {
+    ui_thread: std::thread::ThreadId,
+    gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    bytes: Vec<u8>,
+}
+
+impl filmcraft_engine::Services for BlockedImport {
+    fn read_file(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+        if std::thread::current().id() == self.ui_thread {
+            return Err(std::io::Error::other("media import read on the UI thread"));
+        }
+        let (lock, wake) = &*self.gate;
+        let (released, timeout) = wake.wait_timeout_while(lock.lock().unwrap(), std::time::Duration::from_secs(10), |released| !*released).unwrap();
+        if timeout.timed_out() && !*released {
+            return Err(std::io::Error::other("test import was not released"));
+        }
+        Ok(self.bytes.clone())
+    }
+
+    fn write_file(&self, _path: &str, _data: &[u8]) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+struct ReleaseImport(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl ReleaseImport {
+    fn release(&self) {
+        let (lock, wake) = &*self.0;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+}
+
+impl Drop for ReleaseImport {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[test]
+fn pending_drop_can_be_moved_and_cut_while_playback_shows_loading() {
+    use filmcraft_time::{TICKS_PER_SECOND, Tick};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = ReleaseImport(gate.clone());
+    let services = Arc::new(BlockedImport { ui_thread: std::thread::current().id(), gate, bytes: std::fs::read(tone("drop_pending_tone.wav")).unwrap() });
+    let mut session = Session::default();
+    session.services = services;
+    session.execute("file.newSequence", json!({"name":"Pending drop", "width":1280, "height":720, "fps":24})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).build_eframe(move |_cc| FilmcraftApp::new(session));
+    for _ in 0..4 {
+        step(&mut h);
+    }
+    // The host owns this path; accepting the drop must not stat it through the native filesystem.
+    drop_on_row(&mut h, "timeline.track.A1.target", Path::new("/virtual-filmcraft/pending-tone.wav"));
+    assert_eq!(clip_counts(&h), (0, 1), "the clip exists before its reader is released: {}", h.state().ui.status);
+    let clip = h.state().session.active_sequence().unwrap().audio_tracks[0].items[0].clone();
+    assert!(h.state().session.import_status(clip.item).is_some_and(|status| !status.ready));
+    let loading_id = format!("timeline.clip.{}.import", clip.id.0);
+    assert!(h.state().auto.elements.iter().any(|element| element.id == loading_id));
+
+    h.state_mut().session.set_playhead(clip.start);
+    h.state_mut().play(1.0);
+    for _ in 0..3 {
+        step(&mut h);
+    }
+    assert!(h.state().playback.playing, "the play request stays armed while media loads");
+    assert_eq!(h.state().session.playhead(), clip.start, "waiting must not consume the provisional duration");
+    assert!(h.state().auto.elements.iter().any(|element| element.id == "program.importProgress"));
+    h.state_mut().stop();
+
+    h.state_mut().session.execute("source.open", json!({"item":clip.item.0})).unwrap();
+    h.state_mut().play_source().unwrap();
+    let source_at = h.state().session.state.source_playhead;
+    for _ in 0..3 {
+        step(&mut h);
+    }
+    assert!(h.state().source_playback.clock.playing);
+    assert_eq!(h.state().session.state.source_playhead, source_at);
+    assert!(h.state().auto.elements.iter().any(|element| element.id == "source.importProgress"));
+    h.state_mut().stop_source();
+
+    let start = Tick(3 * TICKS_PER_SECOND);
+    h.state_mut().session.execute("timeline.move", json!({"moves":[{"clip":clip.id.0,"track":"A1","time":start.0}]})).unwrap();
+    let cut = start + Tick(clip.duration.0 / 2);
+    h.state_mut().session.execute("timeline.razor", json!({"clip":clip.id.0,"time":cut.0})).unwrap();
+    let edited = h.state().session.active_sequence().unwrap().audio_tracks[0].items.clone();
+    assert_eq!(edited.len(), 2, "a pending clip supports ordinary timeline edits");
+    assert_eq!(edited[0].id, clip.id);
+    assert_eq!(edited[0].start, start);
+
+    release.release();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.state().session.imports_running() && std::time::Instant::now() < deadline {
+        step(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    step(&mut h);
+    assert!(h.state().session.import_status(clip.item).is_none(), "import finishes after release");
+    let after = &h.state().session.active_sequence().unwrap().audio_tracks[0].items;
+    assert_eq!(after, &edited, "hydration preserves the move, split, clip identities and source ranges");
+    assert!(!h.state().auto.elements.iter().any(|element| element.id == loading_id));
+}
+
 fn float_panel(h: &mut Harness<'static, FilmcraftApp>, panel: &str, rect: [f32; 4]) {
     let ctx = h.ctx.clone();
     filmcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.floatPanel", json!({"panel": panel, "rect": rect})).unwrap();

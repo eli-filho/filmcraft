@@ -136,6 +136,120 @@ fn decimation_caps_hostile_factors_to_the_frame_size() {
 }
 use super::*;
 
+fn old_opaque_bgra8(frame: &VideoFrame) -> Vec<u8> {
+    frame.to_rgba8().as_chunks::<4>().0.iter().flat_map(|&[r, g, b, _]| [b, g, r, 255]).collect()
+}
+
+#[test]
+fn opaque_bgra8_matches_yuv8_display_conversion_and_reuses_destination() {
+    use filmcraft_color::Transfer;
+
+    let (w, h) = (7usize, 5usize);
+    let mut out = vec![17; w * h * 4 + 8];
+    let allocation = out.as_ptr();
+    for chroma in [Chroma::C420, Chroma::C422, Chroma::C444] {
+        let (sx, sy) = chroma.shifts();
+        let chroma_len = w.div_ceil(1 << sx) * h.div_ceil(1 << sy);
+        let plane = |len, step, offset| Arc::new((0..len).map(|i| (i * step + offset) as u8).collect());
+        let planes = [plane(w * h, 37, 7), plane(chroma_len, 73, 160), plane(chroma_len, 53, 49)];
+        for range in [Range::Limited, Range::Full] {
+            for matrix in [Matrix::Bt601, Matrix::Bt709, Matrix::Bt2020Ncl] {
+                for transfer in [Transfer::Bt709, Transfer::Srgb] {
+                    let frame = VideoFrame {
+                        width: w as u32,
+                        height: h as u32,
+                        data: PixelData::Yuv8 { planes: planes.clone(), chroma, alpha: None },
+                        color: ColorInfo { matrix, range, transfer, ..ColorInfo::REC709 },
+                        par: (1, 1),
+                        pts: Tick::ZERO,
+                    };
+                    assert!(frame.to_opaque_bgra8_into(&mut out));
+                    assert_eq!(out, old_opaque_bgra8(&frame), "{chroma:?} {range:?} {matrix:?} {transfer:?}");
+                    assert_eq!(out.as_ptr(), allocation);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn opaque_bgra8_preserves_literal_display_values() {
+    let frame = VideoFrame {
+        width: 2,
+        height: 1,
+        data: PixelData::Yuv8 { planes: [Arc::new(vec![100, 90]), Arc::new(vec![200, 48]), Arc::new(vec![30, 208])], chroma: Chroma::C444, alpha: None },
+        color: ColorInfo { matrix: Matrix::Bt601, ..ColorInfo::SRGB_FULL },
+        par: (1, 1),
+        pts: Tick::ZERO,
+    };
+    assert_eq!(frame.to_rgba8(), [0, 145, 228, 255, 202, 60, 0, 255]);
+    assert_eq!(frame.to_opaque_bgra8().unwrap(), [228, 145, 0, 255, 0, 60, 202, 255]);
+    let rgba = VideoFrame::rgba8(2, 1, vec![13, 29, 211, 0, 201, 43, 21, 127]);
+    assert_eq!(rgba.to_opaque_bgra8().unwrap(), [211, 29, 13, 255, 21, 43, 201, 255]);
+}
+
+#[test]
+fn opaque_bgra8_matches_legacy_fallbacks() {
+    let rgba = VideoFrame::rgba_f32(2, 1, vec![0.25, 0.04, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]);
+    assert_eq!(rgba.to_opaque_bgra8().unwrap(), old_opaque_bgra8(&rgba));
+    assert_eq!(&rgba.to_opaque_bgra8().unwrap()[4..], [0, 0, 0, 255]);
+
+    let frame = VideoFrame {
+        width: 3,
+        height: 1,
+        data: PixelData::Yuv8 {
+            planes: [Arc::new(vec![42, 80, 240]), Arc::new(vec![81, 170]), Arc::new(vec![227, 38])],
+            chroma: Chroma::C420,
+            alpha: Some(Arc::new(vec![0, 100, 255])),
+        },
+        color: ColorInfo::REC709,
+        par: (1, 1),
+        pts: Tick::ZERO,
+    };
+    assert_eq!(frame.to_opaque_bgra8().unwrap(), old_opaque_bgra8(&frame));
+    let hdr = VideoFrame { color: ColorInfo { transfer: filmcraft_color::Transfer::Pq, ..frame.color }, ..frame.clone() };
+    assert_eq!(hdr.to_opaque_bgra8().unwrap(), old_opaque_bgra8(&hdr));
+    for bits in [9, 10, 12, 16] {
+        let yuv16 = VideoFrame {
+            data: PixelData::Yuv16 {
+                planes: [Arc::new(vec![160, 360, 235]), Arc::new(vec![210, 245]), Arc::new(vec![200, 300])],
+                chroma: Chroma::C422,
+                bits,
+                alpha: Some(Arc::new(vec![0, 100, 255])),
+            },
+            ..frame.clone()
+        };
+        assert_eq!(yuv16.to_opaque_bgra8().unwrap(), old_opaque_bgra8(&yuv16));
+    }
+}
+
+#[test]
+fn opaque_bgra8_rejects_hostile_dimensions_and_planes() {
+    let frame = VideoFrame::rgba8(1, 1, vec![0; 4]);
+    for (width, height) in [(0, 1), (1, 0), (8193, 4320), (16_385, 1), (u32::MAX, u32::MAX)] {
+        let hostile = VideoFrame { width, height, ..frame.clone() };
+        let mut out = vec![41, 42, 43, 44];
+        assert!(!hostile.to_opaque_bgra8_into(&mut out));
+        assert_eq!(out, [41, 42, 43, 44]);
+    }
+    for data in [PixelData::Rgba8(Arc::new(vec![0; 3])), PixelData::Rgba8(Arc::new(vec![0; 5])), PixelData::RgbaF32(Arc::new(vec![f32::NAN; 4]))] {
+        assert!(VideoFrame { data, ..frame.clone() }.to_opaque_bgra8().is_none());
+    }
+
+    let planes = [Arc::new(vec![100; 9]), Arc::new(vec![120; 4]), Arc::new(vec![160; 4])];
+    let planar = VideoFrame { width: 3, height: 3, ..frame.clone() };
+    for (y, u, v, alpha) in [(8, 4, 4, None), (9, 3, 4, None), (9, 4, 3, None), (9, 4, 4, Some(8))] {
+        let planes = std::array::from_fn(|i| Arc::new(planes[i][..[y, u, v][i]].to_vec()));
+        let data = PixelData::Yuv8 { planes, chroma: Chroma::C420, alpha: alpha.map(|len| Arc::new(vec![255; len])) };
+        assert!(VideoFrame { data, ..planar.clone() }.to_opaque_bgra8().is_none());
+    }
+    for bits in [0, 8, 17, u32::MAX] {
+        let planes = [Arc::new(vec![100; 9]), Arc::new(vec![120; 4]), Arc::new(vec![160; 4])];
+        let data = PixelData::Yuv16 { planes, chroma: Chroma::C420, bits, alpha: None };
+        assert!(VideoFrame { data, ..planar.clone() }.to_opaque_bgra8().is_none());
+    }
+}
+
 #[test]
 fn rgba8_roundtrip_through_linear() {
     let px: Vec<u8> = (0..=255u8).flat_map(|v| [v, 255 - v, v / 2, 255]).collect();

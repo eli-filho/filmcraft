@@ -1,13 +1,14 @@
 //! Caption layout and burn-in.
 //!
-//! [`overlay`] lays out the caption showing on a track at a time with the track's
+//! [`track_overlay`] lays out the caption showing on a track at a time with the track's
 //! [`CaptionStyle`] (font style, size relative to a 1080-line frame, colour, background box, outline,
-//! alignment, anchor and margin; WebVTT `line:N%` and `align:` cue settings override the style)
-//! and rasterises it into a small premultiplied linear-light RGBA [`Overlay`] positioned in the
+//! alignment, and free placement or anchor and margin). WebVTT `align:` overrides text alignment,
+//! and `line:N%` sets the vertical position when the track has no free placement. The renderer
+//! rasterises it into a small premultiplied linear-light RGBA [`Overlay`] positioned in the
 //! frame. Renderers composite overlays over the finished picture.
 
 use filmcraft_color::srgb_to_linear;
-use filmcraft_project::{Caption, CaptionAlign, CaptionAnchor, CaptionStyle, CaptionTrack, Sequence};
+use filmcraft_project::{Caption, CaptionAlign, CaptionAnchor, CaptionBackgroundMode, CaptionStyle, CaptionTrack, Sequence};
 use filmcraft_time::Tick;
 
 use filmcraft_text::{ParagraphStyle, TextStyle, layout, render};
@@ -17,6 +18,15 @@ use filmcraft_text::{ParagraphStyle, TextStyle, layout, render};
 const MAX_OVERLAY_PIXELS: usize = 16 << 20;
 const MAX_CAPTION_SIZE_1080: f32 = 256.0;
 const MAX_OUTLINE_RADIUS: f32 = 64.0;
+
+/// Frame-pixel bounds of a rendered caption, measured from the upper-left frame corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptionBounds {
+    pub x: i32,
+    pub y: i32,
+    pub w: usize,
+    pub h: usize,
+}
 
 /// A rendered caption: premultiplied linear-light RGBA f32 pixels at `(x, y)` in the frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +95,22 @@ fn wrap(line: &str, ts: &TextStyle, max_w: f32) -> Vec<String> {
     out
 }
 
+/// Reflow editorial line breaks, keeping paragraph and explicit speaker boundaries.
+fn reflow_caption(c: &Caption, ts: &TextStyle, max_width: f32) -> Vec<String> {
+    let mut text = String::new();
+    for raw_line in c.text.lines() {
+        let plain = filmcraft_project::plain_text(raw_line);
+        let line = plain.trim();
+        let speaker = raw_line.trim_start().starts_with("<v ") || line.starts_with(">>") || line.starts_with("- ") || line.starts_with(['–', '—']);
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push(if line.is_empty() || speaker { '\n' } else { ' ' });
+        }
+        text.push_str(line);
+    }
+    let paragraph = ParagraphStyle { width: Some(max_width), ..Default::default() };
+    layout(&text, ts, &paragraph).lines.iter().filter_map(|line| text.get(line.range.clone())).map(str::trim).map(str::to_string).collect()
+}
+
 /// Placement overrides from WebVTT cue settings.
 fn vtt_overrides(settings: &str) -> (Option<f32>, Option<CaptionAlign>) {
     let mut line = None;
@@ -112,28 +138,45 @@ fn vtt_overrides(settings: &str) -> (Option<f32>, Option<CaptionAlign>) {
     (line, align)
 }
 
-/// Lay out and rasterise one caption for a `w`×`h` frame.
-pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> Option<Overlay> {
+struct CaptionLayout {
+    bounds: CaptionBounds,
+    text_style: TextStyle,
+    lines: Vec<String>,
+    widths: Vec<f32>,
+    xs: Vec<f32>,
+    line_height: f32,
+    padding: f32,
+    outline: f32,
+}
+
+fn positioned_origin(center: f32, block_size: f32, frame_size: f32) -> f32 {
+    let remaining = (frame_size - block_size).max(0.0);
+    (center.clamp(0.0, 1.0) * frame_size - block_size / 2.0).round().clamp(0.0, remaining)
+}
+
+fn caption_layout(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> Option<CaptionLayout> {
     if w == 0 || h == 0 {
         return None;
     }
     let scale = h as f32 / 1080.0;
-    let px = (style.size.clamp(4.0, MAX_CAPTION_SIZE_1080) * scale).clamp(4.0, h as f32);
-    let max_w = w as f32 * 0.9;
+    let px = (style.size.clamp(4.0, MAX_CAPTION_SIZE_1080) * scale).max(4.0).min(h as f32);
     let ts = caption_style(&style.font, &style.font_style, px);
-    let mut lines: Vec<String> = Vec::new();
-    // (speaker names are metadata; like Premiere, they are not burned in)
-    for l in c.plain_lines() {
-        lines.extend(wrap(l.trim(), &ts, max_w));
-    }
+    let pad_x = (px * 0.3).round();
+    let outline = (style.outline * scale).clamp(0.0, MAX_OUTLINE_RADIUS);
+    let grow = outline.ceil() + 1.0;
+    let custom_width = style.wrap_width.filter(|width| width.is_finite());
+    let mut lines: Vec<String> = if let Some(width) = custom_width {
+        let available = w as f32 * width.clamp(CaptionStyle::MIN_WRAP_WIDTH, 1.0) - 2.0 * (pad_x + grow);
+        reflow_caption(c, &ts, available.max(1.0))
+    } else {
+        let max_width = w as f32 * CaptionStyle::DEFAULT_WRAP_WIDTH;
+        c.plain_lines().into_iter().flat_map(|line| wrap(line.trim(), &ts, max_width)).collect()
+    };
     lines.retain(|l| !l.is_empty());
     if lines.is_empty() {
         return None;
     }
-    let vm = filmcraft_text::fonts::face(filmcraft_text::resolve(&ts.family, &ts.style).face).metrics(px);
-    let (asc, desc) = (vm.ascent, vm.descent);
     let lh = px * style.line_spacing.clamp(0.8, 4.0);
-    let pad_x = (px * 0.3).round();
     let block_h = lh * lines.len() as f32;
     let (line_override, align_override) = vtt_overrides(&c.settings);
     let align = align_override.unwrap_or(style.align);
@@ -146,9 +189,15 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
     }
     .max(0.0)
     .round();
-    let side = w as f32 * 0.05;
     let widths: Vec<f32> = lines.iter().map(|l| filmcraft_text::measure(l, &ts)).collect();
-    let xs: Vec<f32> = widths
+    let mut side = w as f32 * 0.05;
+    if custom_width.is_some() {
+        // Keep the normal inset where there is room. At full width, let aligned lines reach the
+        // frame edges while reserving enough room for the caption padding and outline.
+        let widest = widths.iter().copied().fold(0.0, f32::max);
+        side = side.max(grow).min((w as f32 - widest - 2.0 * pad_x - grow).max(grow));
+    }
+    let mut xs: Vec<f32> = widths
         .iter()
         .map(|&lw| match align {
             CaptionAlign::Left => side + pad_x,
@@ -156,12 +205,21 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
             CaptionAlign::Center => (w as f32 - lw) / 2.0,
         })
         .collect();
-    let outline = (style.outline * scale).clamp(0.0, MAX_OUTLINE_RADIUS);
-    let grow = outline.ceil() + 1.0;
-    let bx0 = xs.iter().zip(&widths).map(|(x, _)| x - pad_x - grow).fold(f32::MAX, f32::min).floor();
-    let bx1 = xs.iter().zip(&widths).map(|(x, lw)| x + lw + pad_x + grow).fold(f32::MIN, f32::max).ceil();
-    let by0 = (top - grow).floor();
-    let by1 = (top + block_h + grow).ceil();
+    let mut bx0 = xs.iter().zip(&widths).map(|(x, _)| x - pad_x - grow).fold(f32::MAX, f32::min).floor();
+    let mut bx1 = xs.iter().zip(&widths).map(|(x, lw)| x + lw + pad_x + grow).fold(f32::MIN, f32::max).ceil();
+    let mut by0 = (top - grow).floor();
+    let mut by1 = (top + block_h + grow).ceil();
+    if let Some(pos) = style.position.filter(|p| p.x.is_finite() && p.y.is_finite()) {
+        let dx = positioned_origin(pos.x, bx1 - bx0, w as f32) - bx0;
+        let dy = positioned_origin(pos.y, by1 - by0, h as f32) - by0;
+        for x in &mut xs {
+            *x += dx;
+        }
+        bx0 += dx;
+        bx1 += dx;
+        by0 += dy;
+        by1 += dy;
+    }
     // Text can be wider than the frame (an unbroken imported WebVTT word, for example). Raster
     // only the visible intersection; `draw` receives the original coordinates and clips into it.
     let (left, top) = (bx0.clamp(0.0, w as f32), by0.clamp(0.0, h as f32));
@@ -174,21 +232,44 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
     if ow.checked_mul(oh).is_none_or(|pixels| pixels > MAX_OVERLAY_PIXELS) {
         return None;
     }
+    Some(CaptionLayout { bounds: CaptionBounds { x: ox, y: oy, w: ow, h: oh }, text_style: ts, lines, widths, xs, line_height: lh, padding: pad_x, outline })
+}
+
+/// Bounds of the caption's overlay for a `w`×`h` frame, without rasterising it.
+pub fn caption_bounds(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> Option<CaptionBounds> {
+    caption_layout(c, style, w, h).map(|layout| layout.bounds)
+}
+
+fn cover_background(bg: &mut [f32], bounds: CaptionBounds, (x0, x1): (f32, f32), (y0, y1): (f32, f32)) {
+    let CaptionBounds { x: ox, y: oy, w: ow, h: oh } = bounds;
+    for y in (y0.floor() as i32).max(oy)..(y1.ceil() as i32).min(oy + oh as i32) {
+        let fy = ((y as f32 + 1.0).min(y1) - (y as f32).max(y0)).clamp(0.0, 1.0);
+        for x in (x0.floor() as i32).max(ox)..(x1.ceil() as i32).min(ox + ow as i32) {
+            let fx = ((x as f32 + 1.0).min(x1) - (x as f32).max(x0)).clamp(0.0, 1.0);
+            let j = (y - oy) as usize * ow + (x - ox) as usize;
+            bg[j] = (bg[j] + fx * fy).min(1.0);
+        }
+    }
+}
+
+/// Lay out and rasterise one caption for a `w`×`h` frame.
+pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> Option<Overlay> {
+    let CaptionLayout { bounds, text_style: ts, lines, widths, xs, line_height: lh, padding: pad_x, outline } = caption_layout(c, style, w, h)?;
+    let CaptionBounds { x: ox, y: oy, w: ow, h: oh } = bounds;
+    let vm = filmcraft_text::fonts::face(filmcraft_text::resolve(&ts.family, &ts.style).face).metrics(ts.size);
+    let (asc, desc) = (vm.ascent, vm.descent);
     let mut cover = vec![0.0f32; ow * oh];
     let mut bg = vec![0.0f32; ow * oh];
+    let background = (style.background && style.background_color[3] > 0).then_some(style.background_mode);
+    if background == Some(CaptionBackgroundMode::Block) {
+        let left = xs.iter().copied().fold(f32::MAX, f32::min) - pad_x;
+        let right = xs.iter().zip(&widths).map(|(x, w)| x + w).fold(f32::MIN, f32::max) + pad_x;
+        cover_background(&mut bg, bounds, (left, right), (oy as f32, oy as f32 + lh * lines.len() as f32));
+    }
     for (i, line) in lines.iter().enumerate() {
-        let lt = top + lh * i as f32;
-        if style.background && style.background_color[3] > 0 {
-            let (x0, x1) = (xs[i] - pad_x, xs[i] + widths[i] + pad_x);
-            let (y0, y1) = (lt, lt + lh);
-            for y in (y0.floor() as i32).max(oy)..(y1.ceil() as i32).min(oy + oh as i32) {
-                let fy = ((y as f32 + 1.0).min(y1) - (y as f32).max(y0)).clamp(0.0, 1.0);
-                for x in (x0.floor() as i32).max(ox)..(x1.ceil() as i32).min(ox + ow as i32) {
-                    let fx = ((x as f32 + 1.0).min(x1) - (x as f32).max(x0)).clamp(0.0, 1.0);
-                    let j = (y - oy) as usize * ow + (x - ox) as usize;
-                    bg[j] = (bg[j] + fx * fy).min(1.0);
-                }
-            }
+        let lt = oy as f32 + lh * i as f32;
+        if background == Some(CaptionBackgroundMode::PerLine) {
+            cover_background(&mut bg, bounds, (xs[i] - pad_x, xs[i] + widths[i] + pad_x), (lt, lt + lh));
         }
         let baseline = lt + (lh - (asc + desc)) / 2.0 + asc;
         let l = layout(line, &ts, &ParagraphStyle::default());
@@ -287,10 +368,106 @@ pub fn sequence_overlays(seq: &Sequence, t: Tick, w: usize, h: usize) -> Vec<Ove
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filmcraft_project::{CaptionFormat, ClipId, TrackId};
+    use filmcraft_project::{CaptionFormat, CaptionPosition, ClipId, TrackId};
 
     fn cap(text: &str) -> Caption {
         Caption { id: ClipId(1), start: Tick(0), duration: Tick(100), text: text.into(), speaker: None, cue_id: None, settings: String::new() }
+    }
+
+    #[test]
+    fn custom_caption_width_reflows_without_scaling_text() {
+        let c = cap("This is a line\nthat can share one row.\n\nA new paragraph.\n<v Other>A different speaker.\n&gt;&gt; Another speaker.");
+        let style = CaptionStyle { size: 60.0, outline: 6.0, ..Default::default() };
+        let (w, h) = (640, 360);
+        let legacy = caption_layout(&c, &style, w, h).unwrap();
+        let wide = caption_layout(&c, &CaptionStyle { wrap_width: Some(1.0), ..style.clone() }, w, h).unwrap();
+        let narrow = caption_layout(&c, &CaptionStyle { wrap_width: Some(0.22), ..style }, w, h).unwrap();
+        assert_eq!(legacy.lines.len(), 5);
+        assert_eq!(wide.lines, ["This is a line that can share one row.", "A new paragraph.", "A different speaker.", ">> Another speaker."]);
+        assert!(narrow.lines.len() > wide.lines.len());
+        assert_eq!(wide.text_style.size, legacy.text_style.size);
+        assert_eq!(narrow.text_style.size, legacy.text_style.size);
+        assert_eq!(narrow.line_height, wide.line_height);
+        assert!(narrow.bounds.h > wide.bounds.h);
+    }
+
+    #[test]
+    fn full_caption_width_keeps_padding_and_outline_inside_the_frame() {
+        let c = cap(&"wide ".repeat(50));
+        let (w, h) = (640, 360);
+        for align in [CaptionAlign::Left, CaptionAlign::Center, CaptionAlign::Right] {
+            let style = CaptionStyle { align, wrap_width: Some(1.0), outline: 12.0, ..Default::default() };
+            let block = caption_layout(&c, &style, w, h).unwrap();
+            let padding = block.padding + block.outline.ceil() + 1.0;
+            assert!(block.bounds.w > w * 9 / 10, "widest line should use the full picture for {align:?}");
+            for (x, width) in block.xs.iter().zip(&block.widths) {
+                assert!(x - padding >= -0.001 && x + width + padding <= w as f32 + 0.001, "clipped caption for {align:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_background_spans_the_widest_line_across_the_caption() {
+        let caption = cap("I\nA much wider line");
+        let (w, h) = (640, 360);
+        for align in [CaptionAlign::Left, CaptionAlign::Center, CaptionAlign::Right] {
+            let mut style = CaptionStyle { align, color: [0, 0, 0, 0], size: 60.0, position: Some(CaptionPosition { x: 0.9, y: 0.1 }), ..Default::default() };
+            let bounds = caption_bounds(&caption, &style, w, h).unwrap();
+            let per_line = render_caption(&caption, &style, w, h).unwrap();
+            style.background_mode = CaptionBackgroundMode::Block;
+            let block = render_caption(&caption, &style, w, h).unwrap();
+            assert_eq!(bounds, CaptionBounds { x: block.x, y: block.y, w: block.w, h: block.h });
+
+            // At 360p, the two lines are each 25 pixels high. Sample their middle rows.
+            let stride = block.w * 4;
+            let first = 12 * stride..13 * stride;
+            let second = 37 * stride..38 * stride;
+            let wide_row = &per_line.px[second.clone()];
+            assert_ne!(&per_line.px[first.clone()], wide_row);
+            assert_eq!(&block.px[first], wide_row);
+            assert_eq!(&block.px[second], wide_row);
+
+            style.background = false;
+            let hidden = render_caption(&caption, &style, w, h).unwrap();
+            assert!(hidden.px.iter().all(|&p| p == 0.0));
+        }
+    }
+
+    #[test]
+    fn free_caption_position_matches_the_overlay_and_stays_inside_the_frame() {
+        let mut caption = cap("A short line\nThe longer caption line");
+        caption.settings = "line:90% align:left".into();
+        let (w, h) = (1280, 720);
+        let mut style = CaptionStyle { outline: 2.0, position: Some(CaptionPosition { x: 0.25, y: 0.25 }), ..Default::default() };
+        let center = caption_bounds(&caption, &style, w, h).unwrap();
+        let overlay = render_caption(&caption, &style, w, h).unwrap();
+        assert_eq!(center, CaptionBounds { x: overlay.x, y: overlay.y, w: overlay.w, h: overlay.h });
+        assert!((center.x as f32 + center.w as f32 / 2.0 - w as f32 * 0.25).abs() <= 0.5);
+        assert!((center.y as f32 + center.h as f32 / 2.0 - h as f32 * 0.25).abs() <= 0.5);
+        assert!(overlay.px.chunks_exact(4).any(|pixel| pixel[3] > 0.0));
+
+        style.position = Some(CaptionPosition { x: 1.0, y: 0.0 });
+        let edge = caption_bounds(&caption, &style, w, h).unwrap();
+        assert_eq!((edge.w, edge.h), (center.w, center.h));
+        assert_eq!(edge.x as usize + edge.w, w);
+        assert_eq!(edge.y, 0);
+
+        style.position = None;
+        let from_cue = caption_bounds(&caption, &style, w, h).unwrap();
+        assert!(from_cue.y > h as i32 / 2);
+        assert!(from_cue.x < center.x);
+    }
+
+    #[test]
+    fn oversized_caption_in_free_position_is_clipped_to_frame() {
+        let mut caption = cap(&["W".repeat(300), "Two words\n".repeat(40)].join("\n"));
+        caption.settings = "line:100% align:right".into();
+        let style = CaptionStyle { position: Some(CaptionPosition { x: 1.0, y: 1.0 }), ..Default::default() };
+        let (w, h) = (640, 360);
+        let bounds = caption_bounds(&caption, &style, w, h).unwrap();
+        assert_eq!(bounds, CaptionBounds { x: 0, y: 0, w, h });
+        let overlay = render_caption(&caption, &style, w, h).unwrap();
+        assert_eq!(overlay.px.len(), w * h * 4);
     }
 
     #[test]

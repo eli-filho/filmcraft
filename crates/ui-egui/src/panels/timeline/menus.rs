@@ -56,6 +56,7 @@ pub(crate) const CLIP_MENU: &[&[(&str, &str)]] = &[
     &[("Label", "edit.label")],
     &[("Add Marker", "markers.add")],
     &[("Speed/Duration…", "clip.speedDuration"), ("Scene Edit Detection…", "clip.sceneEditDetection")],
+    &[("Remove Background", "clip.removeBackground"), ("Restore Background", "clip.restoreBackground")],
     &[
         ("Frame Hold Options…", "clip.frameHoldOptions"),
         ("Add Frame Hold", "clip.frameHold"),

@@ -128,6 +128,7 @@ fn main() -> eframe::Result {
     // OS hardware video decoders (VideoToolbox on macOS) in front of our own; Settings ▸ Playback ▸
     // Hardware decoding switches them off. Unsupported streams and failures use our decoders.
     register_hardware_decoders();
+    register_background_removal();
     // Which graphics backends and adapter the window starts with: `--graphics`, else the saved
     // mode, which moves on after starts that died before their window painted (a driver crash),
     // see graphics.rs.
@@ -449,6 +450,20 @@ fn register_gpu_frame_renderer() {
     filmcraft_export::register_frame_renderer(|| {
         filmcraft_gpu::ExportRenderer::new().map(|r| Box::new(GpuFrameRenderer(r)) as Box<dyn filmcraft_export::FrameRenderer>)
     });
+}
+
+fn register_background_removal() {
+    use filmcraft_platform::person_segmentation::{PersonSegmenter, available};
+
+    if available() {
+        filmcraft_engine::background::register(|| {
+            let mut segmenter = PersonSegmenter::new().map_err(|e| e.to_string())?;
+            Ok(Box::new(move |frame| {
+                let matte = segmenter.segment_frame(frame).map_err(|e| e.to_string())?;
+                Ok(filmcraft_engine::background::Matte { width: matte.width, height: matte.height, alpha: matte.alpha })
+            }))
+        });
+    }
 }
 
 /// Put the OS hardware video decoders in front of our own. Registered in a statement of its own:

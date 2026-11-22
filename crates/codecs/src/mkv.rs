@@ -19,6 +19,7 @@ use filmcraft_color::{ColorInfo, Matrix, Transfer};
 use filmcraft_frame::{AudioBuffer, VideoFrame};
 use filmcraft_isobmff::{AvcConfig, CodecConfig, FourCc, HevcConfig, PcmConfig, SampleEntry, VpcConfig};
 use filmcraft_matroska::{Codec, MkvFile, TrackKind};
+use filmcraft_media::person_matte::MAX_MATTE_FRAMES;
 use filmcraft_media::{AudioStreamInfo, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo};
 use filmcraft_time::{FrameRate, Tick};
 
@@ -60,6 +61,8 @@ pub struct MkvSource {
     /// Video codec as an ISO-BMFF sample entry (for the decoder factories).
     ventry: Option<SampleEntry>,
     video: GopCache,
+    /// Sorted once for sequential matte analysis and reused for exact matte playback.
+    matte_index: Mutex<Option<Arc<MatteIndex>>>,
     /// Look frames up by the start of their frame: the video track's timestamp unit is half a frame
     /// or longer and its samples sit on the nominal frame grid ([`crate::gop::snap_coarse_units`]).
     snap: bool,
@@ -109,12 +112,30 @@ fn opus_starts(file: &MkvFile, bytes: &crate::Src, ti: usize, head: &filmcraft_o
     let Some(t) = file.tracks.get(ti) else { return Vec::new() };
     let skip = if t.codec_delay_ns > 0 { codec_delay_samples(t, rate) } else { head.pre_skip as i64 };
     let at = stamp_to_samples(t, rate, skip);
-    let packets = t.samples.iter().enumerate().map(|(i, s)| crate::audio::PacketTime {
+    let packets = t.samples.iter().map(|s| crate::audio::PacketTime {
         stamp: at(s.pts),
         stamped: own_stamp(s),
-        samples: file.read_sample(bytes, ti, i).ok().and_then(|p| crate::audio::opus_packet_samples(&p)).map(|k| k as i64),
+        samples: opus_sample_duration(bytes, t, s).map(|k| k as i64),
     });
     crate::audio::contiguous_starts(packets, stamp_tolerance(t, rate))
+}
+
+/// Opus duration needs at most its TOC and frame-count byte, not its compressed payload.
+/// Sample offsets already identify individual laces. Restore any stripped prefix so this
+/// reads the same codec bytes as `read_sample`, including tracks that strip the TOC itself.
+fn opus_sample_duration(bytes: &crate::Src, track: &filmcraft_matroska::Track, sample: &filmcraft_matroska::Sample) -> Option<usize> {
+    if !track.frames_readable() || sample.offset.checked_add(u64::from(sample.size))? > bytes.0.len() {
+        return None;
+    }
+    let prefix = track.stripped_header().unwrap_or_default();
+    let mut header = [0u8; 2];
+    let copied = prefix.len().min(header.len());
+    header.get_mut(..copied)?.copy_from_slice(prefix.get(..copied)?);
+    let stored = (header.len() - copied).min(sample.size as usize);
+    if stored > 0 {
+        bytes.0.read_at(sample.offset, header.get_mut(copied..copied + stored)?).ok()?;
+    }
+    crate::audio::opus_packet_samples(header.get(..copied + stored)?)
 }
 
 /// A block timestamp (with the demuxer's rounded `CodecDelay` taken off) as a position in sample
@@ -488,7 +509,33 @@ impl MkvSource {
             let (n, d) = tb(t);
             crate::gop::snap_coarse_units(t.samples.iter().map(|s| s.pts), n, d, v.frame_rate)
         });
-        Ok(Self { info, bytes, file, vtrack, ventry, video: GopCache::new(explicit_color).with_rotation(rotation), snap, alpha, audios })
+        Ok(Self {
+            info,
+            bytes,
+            file,
+            vtrack,
+            ventry,
+            video: GopCache::new(explicit_color).with_rotation(rotation),
+            matte_index: Mutex::default(),
+            snap,
+            alpha,
+            audios,
+        })
+    }
+
+    fn matte_index(&self, ti: usize, limit: usize) -> Result<Arc<MatteIndex>, MediaError> {
+        let track = self.file.tracks.get(ti).ok_or(MediaError::NoStream("video"))?;
+        let limit = limit.min(MAX_MATTE_FRAMES);
+        if track.samples.len() > limit {
+            return Err(MediaError::Unsupported(format!("Remove Background supports up to {limit} source frames")));
+        }
+        let mut cached = self.matte_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = cached.as_ref() {
+            return Ok(index.clone());
+        }
+        let index = Arc::new(MatteIndex::new(track.samples.iter().map(|sample| sample.pts))?);
+        *cached = Some(index.clone());
+        Ok(index)
     }
 
     fn read(&self, track: usize, i: usize) -> crate::Result<Vec<u8>> {
@@ -582,10 +629,33 @@ impl MkvSource {
     }
 }
 
+/// Presentation order with file-order tie breaking, matching Track::sample_at_pts. A full-source
+/// analysis uses this index because a linear scan per picture would make the job quadratic.
+struct MatteIndex(Vec<(i64, usize)>);
+
+impl MatteIndex {
+    fn new(stamps: impl ExactSizeIterator<Item = i64>) -> Result<Self, MediaError> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(stamps.len()).map_err(|_| MediaError::Decode("could not allocate the person matte frame index".into()))?;
+        entries.extend(stamps.enumerate().map(|(index, pts)| (pts, index)));
+        entries.sort_unstable();
+        Ok(Self(entries))
+    }
+
+    fn sample_at(&self, target: i64) -> Option<usize> {
+        let end = self.0.partition_point(|&(pts, _)| pts <= target);
+        match end.checked_sub(1) {
+            Some(index) => self.0.get(index).map(|&(_, sample)| sample),
+            None => (!self.0.is_empty()).then_some(0),
+        }
+    }
+}
+
 /// The Matroska video track as a [`VideoSamples`] table.
 struct MkvVideo<'a> {
     src: &'a MkvSource,
     track: usize,
+    matte_index: Option<&'a MatteIndex>,
 }
 
 impl VideoSamples for MkvVideo<'_> {
@@ -600,7 +670,10 @@ impl VideoSamples for MkvVideo<'_> {
     }
     fn sample_at(&self, t: i64) -> Option<usize> {
         let track = &self.src.file.tracks[self.track];
-        let i = track.sample_at_pts(t)?;
+        let i = match self.matte_index {
+            Some(index) => index.sample_at(t),
+            None => track.sample_at_pts(t),
+        }?;
         if !matches!(track.codec, Codec::Vp8) {
             return Some(i);
         }
@@ -642,7 +715,42 @@ impl MediaSource for MkvSource {
         let rate = self.info.video.as_ref().map(|v| v.frame_rate).unwrap_or_default();
         let target = from_tick(&self.file.tracks[ti], rate, t, self.snap);
         let late = filmcraft_media::cancel::catch_up().map(|m| from_tick(&self.file.tracks[ti], rate, t - m, self.snap));
-        Ok(self.video.frame_late(&MkvVideo { src: self, track: ti }, target, late)?)
+        Ok(self.video.frame_late(&MkvVideo { src: self, track: ti, matte_index: None }, target, late)?)
+    }
+
+    fn matte_frame_keys(&self, limit: usize) -> Result<Vec<i64>, MediaError> {
+        let ti = self.vtrack.ok_or(MediaError::NoStream("video"))?;
+        let track = self.file.tracks.get(ti).ok_or(MediaError::NoStream("video"))?;
+        let index = self.matte_index(ti, limit)?;
+        let video = MkvVideo { src: self, track: ti, matte_index: Some(&index) };
+        let first = video.sample_at(0).map(|i| video.pts(i)).ok_or(MediaError::NoStream("video frames"))?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(index.0.len()).map_err(|_| MediaError::Decode("could not allocate the person matte frame keys".into()))?;
+        // If no picture precedes zero, playback starts with the first file-order sample.
+        // Reordered samples with smaller positive timestamps may still become visible later.
+        keys.extend(index.0.iter().map(|&(pts, _)| pts).filter(|&pts| pts == first || pts > 0));
+        keys.dedup();
+        // The decoder selects the next displayed frame at a hidden VP8 block's timestamp.
+        if matches!(track.codec, Codec::Vp8) {
+            keys.retain(|&pts| video.sample_at(pts.max(0)).is_some_and(|i| video.pts(i) == pts));
+        }
+        Ok(keys)
+    }
+
+    fn matte_frame(&self, key: i64) -> Result<Arc<VideoFrame>, MediaError> {
+        let ti = self.vtrack.ok_or(MediaError::NoStream("video"))?;
+        let index = self.matte_index(ti, MAX_MATTE_FRAMES)?;
+        Ok(self.video.frame(&MkvVideo { src: self, track: ti, matte_index: Some(&index) }, key)?)
+    }
+
+    fn matte_frame_key(&self, time: Tick) -> Option<i64> {
+        let ti = self.vtrack?;
+        let track = self.file.tracks.get(ti)?;
+        let rate = self.info.video.as_ref()?.frame_rate;
+        let target = from_tick(track, rate, time.max(Tick::ZERO), self.snap);
+        let index = self.matte_index(ti, MAX_MATTE_FRAMES).ok()?;
+        let video = MkvVideo { src: self, track: ti, matte_index: Some(&index) };
+        video.sample_at(target.max(0)).map(|i| video.pts(i))
     }
 
     /// The frame as decoded, with the track's display rotation left to the caller (#3467).
@@ -652,7 +760,7 @@ impl MediaSource for MkvSource {
         let rate = self.info.video.as_ref().map(|v| v.frame_rate).unwrap_or_default();
         let target = from_tick(&self.file.tracks[ti], rate, t, self.snap);
         let late = filmcraft_media::cancel::catch_up().map(|m| from_tick(&self.file.tracks[ti], rate, t - m, self.snap));
-        Ok(self.video.frame_late_unturned(&MkvVideo { src: self, track: ti }, target, late)?)
+        Ok(self.video.frame_late_unturned(&MkvVideo { src: self, track: ti, matte_index: None }, target, late)?)
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
@@ -756,6 +864,97 @@ mod multi_audio_tests {
 }
 
 #[cfg(test)]
+mod opus_prefix_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use filmcraft_matroska::{ContentEncoding, LacingMode, MkvWriter, MuxOptions, TrackKind, TrackSpec};
+    use filmcraft_media::reader::{ByteReader, MemReader};
+
+    use super::{MkvFile, opus_head, opus_sample_duration, opus_starts};
+
+    struct HeaderOnly {
+        bytes: MemReader,
+        read: AtomicUsize,
+    }
+
+    impl ByteReader for HeaderOnly {
+        fn len(&self) -> u64 {
+            self.bytes.len()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            assert!(buf.len() <= 2, "duration inspection must not read Opus packet payloads");
+            self.read.fetch_add(buf.len(), Ordering::Relaxed);
+            self.bytes.read_at(offset, buf)
+        }
+    }
+
+    fn fixture(lacing: LacingMode, first_byte: u8) -> (MkvFile, Arc<HeaderOnly>) {
+        let mut track = TrackSpec::new(TrackKind::Audio, "A_OPUS");
+        track.audio = Some((48_000.0, 1, None));
+        track.default_duration_ns = Some(20_000_000);
+        track.codec_private = b"OpusHead\x01\x01\x00\x00\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let options = MuxOptions { lacing, ..MuxOptions::default() };
+        let mut writer = MkvWriter::new(std::io::Cursor::new(Vec::new()), vec![track], options).unwrap();
+        let mut packet = vec![0u8; 4096];
+        packet[0] = first_byte;
+        for i in 0..4 {
+            writer.write_frame(0, i * 20_000_000, true, &packet, None).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let file = filmcraft_matroska::open(bytes.as_slice()).unwrap();
+        (file, Arc::new(HeaderOnly { bytes: MemReader(bytes.into()), read: AtomicUsize::new(0) }))
+    }
+
+    #[test]
+    fn duration_index_reads_only_two_bytes_per_packet_for_every_lacing_mode() {
+        for lacing in [LacingMode::None, LacingMode::Xiph, LacingMode::Ebml, LacingMode::FixedOrEbml] {
+            let (file, reader) = fixture(lacing, 0x98); // one 20 ms CELT frame
+            let track = &file.tracks[0];
+            if lacing != LacingMode::None {
+                assert!(track.samples.iter().any(|s| s.lace > 0));
+            }
+            let head = opus_head(&track.codec).unwrap();
+            let starts = opus_starts(&file, &crate::Src(reader.clone()), 0, &head, 48_000);
+            assert_eq!(starts, [0, 960, 1920, 2880]);
+            assert_eq!(reader.read.load(Ordering::Relaxed), 8);
+        }
+    }
+
+    #[test]
+    fn stripped_toc_and_frame_count_are_restored_without_reading_payloads() {
+        let (mut file, reader) = fixture(LacingMode::None, 2);
+        let track = &mut file.tracks[0];
+        let sample = track.samples[0];
+        track.encodings = vec![ContentEncoding::HeaderStripping { bytes: vec![0x9B], scope: 1 }];
+        assert_eq!(opus_sample_duration(&crate::Src(reader.clone()), track, &sample), Some(1920));
+        assert_eq!(reader.read.load(Ordering::Relaxed), 1);
+        track.encodings = vec![ContentEncoding::HeaderStripping { bytes: vec![0x9B, 3, 0xFF], scope: 1 }];
+        assert_eq!(opus_sample_duration(&crate::Src(reader.clone()), track, &sample), Some(2880));
+        assert_eq!(reader.read.load(Ordering::Relaxed), 1, "the complete duration header was stripped");
+        track.encodings = vec![ContentEncoding::Encryption { scope: 1 }];
+        assert_eq!(opus_sample_duration(&crate::Src(reader), track, &sample), None);
+    }
+
+    #[test]
+    fn empty_truncated_and_overflowing_samples_keep_unknown_duration() {
+        let (file, reader) = fixture(LacingMode::None, 0x9B);
+        let track = &file.tracks[0];
+        let bytes = crate::Src(reader.clone());
+        let mut sample = track.samples[0];
+        sample.size = 0;
+        assert_eq!(opus_sample_duration(&bytes, track, &sample), None);
+        sample.size = 1;
+        assert_eq!(opus_sample_duration(&bytes, track, &sample), None, "code 3 needs a frame-count byte");
+        sample.size = 2;
+        sample.offset = reader.len() - 1;
+        assert_eq!(opus_sample_duration(&bytes, track, &sample), None);
+        sample.offset = u64::MAX;
+        assert_eq!(opus_sample_duration(&bytes, track, &sample), None);
+    }
+}
+
+#[cfg(test)]
 mod origin_tests {
     use filmcraft_frame::PixelData;
     use filmcraft_matroska::{MkvWriter, MuxOptions, TrackKind, TrackSpec};
@@ -768,6 +967,32 @@ mod origin_tests {
         let mut out = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95).encode_image(&img).unwrap();
         out
+    }
+
+    #[test]
+    fn matte_keys_preserve_playback_selection_with_reordered_and_repeated_timestamps() {
+        let mut v = TrackSpec::new(TrackKind::Video, "V_MJPEG");
+        v.video_size = Some((16, 16));
+        v.default_duration_ns = Some(40_000_000);
+        let mut a = TrackSpec::new(TrackKind::Audio, "A_PCM/INT/LIT");
+        a.audio = Some((48_000.0, 1, Some(16)));
+        let mut w = MkvWriter::new(std::io::Cursor::new(Vec::new()), vec![v, a], MuxOptions::default()).unwrap();
+        // Sound anchors media time zero before every picture. File-order picture 0 is shown
+        // before the first PTS, and file-order picture 2 wins the tie at 40 ms.
+        w.write_frame(1, 0, true, &[0; 96], Some(1_000_000)).unwrap();
+        for (k, ms) in [120, 40, 40, 70].into_iter().enumerate() {
+            w.write_frame(0, ms * 1_000_000, true, &picture(k as u8), None).unwrap();
+        }
+        let src = super::MkvSource::open("reordered.mkv", w.finish().unwrap().into_inner().into()).unwrap();
+        assert!(src.matte_frame_keys(3).is_err());
+        assert_eq!(src.matte_frame_keys(4).unwrap(), [40, 70, 120]);
+        for (ms, key, level) in [(0, 120, 20), (40, 40, 60), (70, 70, 80), (120, 120, 20)] {
+            let time = Tick::from_rational(ms, 1, 1000);
+            assert_eq!(src.matte_frame_key(time), Some(key));
+            let indexed = src.matte_frame(key).unwrap().to_rgba8();
+            assert_eq!(indexed[0], level);
+            assert_eq!(indexed, src.video_frame(FrameRequest::full(time)).unwrap().to_rgba8());
+        }
     }
 
     /// #715: a remux that keeps its source's timestamps (first picture at 1.48 s, sound 0.2 s after

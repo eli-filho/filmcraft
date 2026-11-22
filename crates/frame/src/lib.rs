@@ -665,37 +665,9 @@ impl VideoFrame {
         let (w, h) = (self.width as usize, self.height as usize);
         match &self.data {
             PixelData::Rgba8(d) => d.as_ref().clone(),
-            PixelData::Yuv8 { planes, chroma, alpha: None }
-                if matches!(self.color.transfer, filmcraft_color::Transfer::Bt709 | filmcraft_color::Transfer::Srgb) =>
-            {
-                // Direct display path: Y'CbCr → R'G'B' without linearisation.
-                let (sx, sy) = chroma.shifts();
-                let cw = w.div_ceil(1 << sx);
-                let (kr, kb) = self.color.matrix.kr_kb();
-                let kg = 1.0 - kr - kb;
-                let (ys, yo, cs) = match self.color.range {
-                    Range::Limited => (255.0 / 219.0, 16.0, 255.0 / 224.0),
-                    Range::Full => (1.0, 0.0, 1.0),
-                };
-                let (crr, cbb) = (2.0 * (1.0 - kr) * cs, 2.0 * (1.0 - kb) * cs);
-                let (cgr, cgb) = (crr * kr / kg, cbb * kb / kg);
+            PixelData::Yuv8 { planes, chroma, alpha: None } if self.direct_display_transfer() => {
                 let mut out = vec![0u8; w * h * 4];
-                out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-                    let cy = y >> sy;
-                    let yrow = &planes[0][y * w..y * w + w];
-                    let urow = &planes[1][cy * cw..cy * cw + cw];
-                    let vrow = &planes[2][cy * cw..cy * cw + cw];
-                    for x in 0..w {
-                        let yy = (yrow[x] as f32 - yo) * ys;
-                        let u = urow[x >> sx] as f32 - 128.0;
-                        let v = vrow[x >> sx] as f32 - 128.0;
-                        let o = &mut row[x * 4..x * 4 + 4];
-                        o[0] = (yy + crr * v).round().clamp(0.0, 255.0) as u8;
-                        o[1] = (yy - cgr * v - cgb * u).round().clamp(0.0, 255.0) as u8;
-                        o[2] = (yy + cbb * u).round().clamp(0.0, 255.0) as u8;
-                        o[3] = 255;
-                    }
-                });
+                self.write_yuv8_display_bytes::<false>(planes, *chroma, &mut out);
                 out
             }
             _ => {
@@ -705,6 +677,94 @@ impl VideoFrame {
                 out
             }
         }
+    }
+
+    /// Convert a valid frame to packed BGRA8 for analysis. RGB matches [`Self::to_rgba8`],
+    /// and every output alpha is opaque. Refuses malformed or oversized input.
+    pub fn to_opaque_bgra8(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.to_opaque_bgra8_into(&mut out).then_some(out)
+    }
+
+    /// Like [`Self::to_opaque_bgra8`], reusing the destination allocation for opaque SDR YUV8.
+    /// Returns false without writing any pixels if validation or reserving the buffer fails.
+    pub fn to_opaque_bgra8_into(&self, out: &mut Vec<u8>) -> bool {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let Some(pixels) = w.checked_mul(h).filter(|&n| n > 0 && n <= 8192 * 4320) else { return false };
+        if w > 16_384 || h > 16_384 {
+            return false;
+        }
+        let Some(len) = pixels.checked_mul(4) else { return false };
+        match &self.data {
+            PixelData::Rgba8(data) if data.len() != len => return false,
+            PixelData::RgbaF32(data) if data.len() != len || data.iter().any(|value| !value.is_finite()) => return false,
+            PixelData::Yuv8 { planes, chroma, alpha } => {
+                if !self.has_yuv_planes(planes, *chroma, alpha.as_ref(), pixels) {
+                    return false;
+                }
+                if alpha.is_none() && self.direct_display_transfer() {
+                    if out.try_reserve_exact(len.saturating_sub(out.len())).is_err() {
+                        return false;
+                    }
+                    out.resize(len, 0);
+                    self.write_yuv8_display_bytes::<true>(planes, *chroma, out);
+                    return true;
+                }
+            }
+            PixelData::Yuv16 { planes, chroma, bits, alpha } if !(9..=16).contains(bits) || !self.has_yuv_planes(planes, *chroma, alpha.as_ref(), pixels) => {
+                return false;
+            }
+            _ => {}
+        }
+
+        let mut packed = self.to_rgba8();
+        for pixel in packed.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+            pixel[3] = 255;
+        }
+        *out = packed;
+        true
+    }
+
+    fn has_yuv_planes<T>(&self, planes: &[Arc<Vec<T>>; 3], chroma: Chroma, alpha: Option<&Arc<Vec<T>>>, pixels: usize) -> bool {
+        let (sx, sy) = chroma.shifts();
+        let chroma_pixels = (self.width as usize).div_ceil(1 << sx).checked_mul((self.height as usize).div_ceil(1 << sy));
+        let [y, u, v] = planes;
+        y.len() >= pixels && chroma_pixels.is_some_and(|n| u.len() >= n && v.len() >= n) && alpha.is_none_or(|a| a.len() >= pixels)
+    }
+
+    fn direct_display_transfer(&self) -> bool {
+        matches!(self.color.transfer, filmcraft_color::Transfer::Bt709 | filmcraft_color::Transfer::Srgb)
+    }
+
+    /// Direct display path: Y'CbCr → R'G'B' without linearisation.
+    fn write_yuv8_display_bytes<const BGRA: bool>(&self, planes: &[Arc<Vec<u8>>; 3], chroma: Chroma, out: &mut [u8]) {
+        let w = self.width as usize;
+        let (sx, sy) = chroma.shifts();
+        let cw = w.div_ceil(1 << sx);
+        let (kr, kb) = self.color.matrix.kr_kb();
+        let kg = 1.0 - kr - kb;
+        let (ys, yo, cs) = match self.color.range {
+            Range::Limited => (255.0 / 219.0, 16.0, 255.0 / 224.0),
+            Range::Full => (1.0, 0.0, 1.0),
+        };
+        let (crr, cbb) = (2.0 * (1.0 - kr) * cs, 2.0 * (1.0 - kb) * cs);
+        let (cgr, cgb) = (crr * kr / kg, cbb * kb / kg);
+        out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            let cy = y >> sy;
+            let yrow = &planes[0][y * w..y * w + w];
+            let urow = &planes[1][cy * cw..cy * cw + cw];
+            let vrow = &planes[2][cy * cw..cy * cw + cw];
+            for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let yy = (yrow[x] as f32 - yo) * ys;
+                let u = urow[x >> sx] as f32 - 128.0;
+                let v = vrow[x >> sx] as f32 - 128.0;
+                let r = (yy + crr * v).round().clamp(0.0, 255.0) as u8;
+                let g = (yy - cgr * v - cgb * u).round().clamp(0.0, 255.0) as u8;
+                let b = (yy + cbb * u).round().clamp(0.0, 255.0) as u8;
+                *pixel = if BGRA { [b, g, r, 255] } else { [r, g, b, 255] };
+            }
+        });
     }
 
     /// Luma plane (8-bit, for scopes/thumbnails analysis).

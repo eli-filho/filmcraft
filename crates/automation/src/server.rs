@@ -645,7 +645,7 @@ impl ServerHandler for FilmcraftMcp {
             .with_instructions(INSTRUCTIONS.to_string())
     }
 
-    /// Strict arguments and long exports in front of the tool router.
+    /// Strict arguments and long jobs in front of the tool router.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -654,7 +654,7 @@ impl ServerHandler for FilmcraftMcp {
         if let Some(m) = self.unknown_arg(&request.name, request.arguments.as_ref()) {
             return Err(McpError::invalid_params(m, None));
         }
-        // A blocking export reports progress and can be cancelled (docs/agents.md § Long exports).
+        // A blocking job reports progress and can be cancelled (docs/agents.md § Long exports).
         // Bridge mode too: the app runs it as a job, so it stays responsive (#91, #92).
         if request.name == "command_run"
             && let Some(a) = &request.arguments

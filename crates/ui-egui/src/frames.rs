@@ -17,7 +17,7 @@ use web_time::Instant;
 
 use filmcraft_engine::previews::PreviewStore;
 use filmcraft_engine::{MediaPool, Services};
-use filmcraft_project::{ItemId, Project};
+use filmcraft_project::{ItemId, PersonMatteRef, Project};
 use filmcraft_time::Tick;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -308,6 +308,12 @@ impl filmcraft_media::MediaSource for TimedSource {
     fn video_frame_unturned(&self, req: filmcraft_media::FrameRequest) -> filmcraft_media::Result<(Arc<filmcraft_frame::VideoFrame>, u8)> {
         timed_source(|| self.0.video_frame_unturned(req))
     }
+    fn matte_frame_key(&self, time: Tick) -> Option<i64> {
+        self.0.matte_frame_key(time)
+    }
+    fn matte_frame(&self, key: i64) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+        timed_source(|| self.0.matte_frame(key))
+    }
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
         self.0.audio(start, frames, sample_rate)
     }
@@ -326,6 +332,18 @@ impl filmcraft_render::SourceProvider for JobProvider {
     fn source(&self, item: ItemId) -> Option<filmcraft_media::SharedSource> {
         let s = self.inner.pool.monitor_source(item, self.inner.source(item)?);
         Some(Arc::new(TimedSource(s)))
+    }
+
+    fn person_matte(&self, item: ItemId, reference: &PersonMatteRef) -> Option<filmcraft_media::person_matte::MatteReader> {
+        self.inner.person_matte(item, reference)
+    }
+
+    fn matte_source(&self, item: ItemId) -> Option<filmcraft_media::SharedSource> {
+        Some(Arc::new(TimedSource(self.inner.matte_source(item)?)))
+    }
+
+    fn person_matte_failed(&self, item: ItemId) {
+        self.inner.person_matte_failed(item);
     }
 }
 

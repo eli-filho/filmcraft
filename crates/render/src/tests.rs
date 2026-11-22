@@ -66,6 +66,129 @@ fn composites_tracks_and_opacity() {
 }
 
 #[test]
+fn person_matte_tracks_the_source_frame_in_preview_and_export() {
+    use filmcraft_media::person_matte::MatteWriter;
+    use filmcraft_project::MediaIdentity;
+
+    struct Keyed(SharedSource);
+    impl MediaSource for Keyed {
+        fn info(&self) -> &filmcraft_media::MediaInfo {
+            self.0.info()
+        }
+        fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+            self.0.video_frame(req)
+        }
+        fn matte_frame_key(&self, time: Tick) -> Option<i64> {
+            match self.info().frame_rate().frame_at(time) {
+                4 => Some(51),
+                5 => Some(79),
+                _ => None,
+            }
+        }
+        fn matte_frame(&self, key: i64) -> filmcraft_media::Result<Arc<VideoFrame>> {
+            let rate = self.info().frame_rate();
+            self.0.video_frame(FrameRequest::full(rate.tick_of(if key == 51 { 4 } else { 5 })))
+        }
+        fn audio(&self, start: i64, count: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+            self.0.audio(start, count, rate)
+        }
+    }
+
+    struct Provider {
+        ordinary: SourceMap,
+        original: SharedSource,
+        matte: MatteReader,
+        item: ItemId,
+        matte_failed: std::sync::atomic::AtomicBool,
+    }
+    impl SourceProvider for Provider {
+        fn source(&self, item: ItemId) -> Option<SharedSource> {
+            self.ordinary.source(item)
+        }
+        fn person_matte(&self, item: ItemId, _reference: &PersonMatteRef) -> Option<MatteReader> {
+            (item == self.item).then(|| self.matte.clone())
+        }
+        fn matte_source(&self, item: ItemId) -> Option<SharedSource> {
+            (item == self.item).then(|| self.original.clone())
+        }
+        fn person_matte_failed(&self, _item: ItemId) {
+            self.matte_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let (mut project, red, ocean, seq, mut ordinary) = setup();
+    let (rate, identity) = (FrameRate::FPS_24, MediaIdentity { size: 123, fingerprint: 456 });
+    project.item_mut(red).unwrap().as_media_mut().unwrap().identity = Some(identity);
+    let blue = GeneratorSource::new(Generator::ColorMatte { color: [0.0, 0.0, 1.0, 1.0] }, 320, 180, rate, rate.tick_of(3));
+    let background = project.item_mut(ocean).unwrap().as_media_mut().unwrap();
+    background.info = blue.info().clone();
+    background.media = MediaRef::Generator(blue.generator.clone());
+    ordinary.0.insert(ocean, Arc::new(blue));
+    let background_clip = place(&mut project, seq, 0, ocean, 0, 3);
+    let cutout = place(&mut project, seq, 1, red, 0, 2);
+    {
+        let (_, item) = project.sequence_mut(seq).unwrap().find_item_mut(cutout).unwrap();
+        item.source_in = rate.tick_of(4);
+        item.person_matte = Some(PersonMatteRef { cache_id: "fixture".into(), source: identity, bypassed: false });
+        item.effect_mut("motion").unwrap().params.get_mut("position").unwrap().value = ParamValue::Vec2(Vec2::new(180.0, 90.0));
+    }
+    let path = std::env::temp_dir().join(format!("filmcraft-render-matte-{}.bin", std::process::id()));
+    let mut writer = MatteWriter::new(std::fs::File::create(&path).unwrap(), 2, 1, 2).unwrap();
+    writer.push(51, &[255, 0]).unwrap();
+    writer.push(79, &[0, 255]).unwrap();
+    writer.finish().unwrap();
+    let original = Arc::new(Keyed(ordinary.source(red).unwrap()));
+    // A different regular source stands in as a proxy. Its frames must not drive the matte.
+    ordinary.0.insert(red, ordinary.source(ocean).unwrap());
+    let provider = Provider { ordinary, original, matte: MatteReader::open(&path).unwrap(), item: red, matte_failed: Default::default() };
+    let opts = RenderOptions::default();
+    for (time, foreground_x, background_x) in [(Tick::ZERO, 60, 310), (rate.tick_of(1), 310, 60)] {
+        let full = render_sequence(&project, seq, time, opts, &provider);
+        let preview = plan::execute_cpu(&plan::plan_frame(&project, seq, time, opts, plan::DeviceCaps::ALL, &provider));
+        let background = render_clip(&project, seq, background_clip, time, opts, &provider).unwrap();
+        assert_eq!(full.get(foreground_x, 90), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(full.get(background_x, 90), background.get(background_x, 90));
+        assert_eq!(preview.get(foreground_x, 90), full.get(foreground_x, 90));
+        assert_eq!(preview.get(background_x, 90), full.get(background_x, 90));
+        assert_eq!(full.get(170, 90)[0] > 0.5, time == Tick::ZERO, "the cutout moves with the clip's 20-pixel Motion offset");
+    }
+
+    let (_, item) = project.sequence_mut(seq).unwrap().find_item_mut(cutout).unwrap();
+    item.reverse = true;
+    let reversed = render_sequence(&project, seq, Tick::ZERO, opts, &provider);
+    assert_eq!(reversed.get(310, 90), [1.0, 0.0, 0.0, 1.0]);
+
+    // Frame hold changes the picture's key independently of the Motion/effect evaluation time.
+    let (_, item) = project.sequence_mut(seq).unwrap().find_item_mut(cutout).unwrap();
+    item.reverse = false;
+    item.frame_hold = Some(rate.tick_of(5));
+    let held = render_sequence(&project, seq, Tick::ZERO, opts, &provider);
+    assert_eq!(held.get(310, 90), [1.0, 0.0, 0.0, 1.0]);
+
+    let restored = Project::from_json(&project.to_json()).unwrap();
+    let (_, item) = restored.sequence(seq).unwrap().find_item(cutout).unwrap();
+    assert_eq!(item.person_matte.as_ref().unwrap().source, identity);
+    let active = preview::video_segments(&project, seq);
+    assert!(active[0].matte_sources.contains(&(red, item.person_matte.clone().unwrap())));
+    let (_, item) = project.sequence_mut(seq).unwrap().find_item_mut(cutout).unwrap();
+    item.person_matte.as_mut().unwrap().bypassed = true;
+    let bypassed = preview::video_segments(&project, seq);
+    assert!(bypassed[0].matte_sources.is_empty());
+    assert_ne!(active[0].hash, bypassed[0].hash);
+    let frame = render_sequence(&project, seq, Tick::ZERO, opts, &provider);
+    assert_ne!(frame.get(310, 90), held.get(310, 90));
+    assert!(!provider.matte_failed.load(std::sync::atomic::Ordering::Relaxed));
+
+    let (_, item) = project.sequence_mut(seq).unwrap().find_item_mut(cutout).unwrap();
+    item.person_matte.as_mut().unwrap().bypassed = false;
+    project.item_mut(red).unwrap().as_media_mut().unwrap().identity = None;
+    let _ = render_sequence(&project, seq, Tick::ZERO, opts, &provider);
+    assert!(provider.matte_failed.load(std::sync::atomic::Ordering::Relaxed));
+    drop(provider);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn half_resolution_matches_full_downsampled() {
     let (mut p, _red, ocean, seq, map) = setup();
     place(&mut p, seq, 0, ocean, 0, 48);

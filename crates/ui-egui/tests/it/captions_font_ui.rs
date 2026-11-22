@@ -1,5 +1,4 @@
-//! Headless UI test of the caption track font picker in the Text panel's Captions tab: picking a
-//! family sets the track style's font, and macOS-private (`.`-prefixed) faces are not offered.
+//! Headless UI tests of the Text panel's Captions tab and its track style controls.
 
 use std::sync::mpsc::{Sender, channel};
 
@@ -56,10 +55,9 @@ impl Driver {
         v.as_array().unwrap().iter().filter_map(|e| e["id"].as_str().map(str::to_string)).collect()
     }
 
-    fn font(&mut self, track: u64) -> String {
+    fn style(&mut self, track: u64) -> Value {
         let r = self.ok("engine.execute", json!({"command": "captions.list", "params": {}}));
-        let t = r["tracks"].as_array().unwrap().iter().find(|t| t["id"] == json!(track)).expect("track").clone();
-        t["style"]["font"].as_str().unwrap().to_string()
+        r["tracks"].as_array().unwrap().iter().find(|t| t["id"] == json!(track)).expect("track")["style"].clone()
     }
 }
 
@@ -72,7 +70,7 @@ fn caption_font_picker_sets_the_track_font() {
     d.frames(2);
     d.ok("ui.click", json!({"id": "text.tab.Captions"}));
     d.frames(3);
-    assert_eq!(d.font(track), "Inter");
+    assert_eq!(d.style(track)["font"], "Inter");
 
     d.ok("ui.click", json!({"id": "text.captions.style.font"}));
     d.frames(3);
@@ -93,7 +91,30 @@ fn caption_font_picker_sets_the_track_font() {
     }
     d.ok("ui.click", json!({"id": serif}));
     d.frames(3);
-    assert_eq!(d.font(track), "Noto Serif");
+    assert_eq!(d.style(track)["font"], "Noto Serif");
+}
+
+#[test]
+fn caption_background_opacity_preserves_the_chosen_color() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    let track = d.ok("engine.execute", json!({"command": "captions.newTrack", "params": {"format": "Subtitle"}}))["track"].as_u64().unwrap();
+    d.ok("engine.execute", json!({"command": "captions.setStyle", "params": {"track": track, "backgroundColor": "#204080bf"}}));
+    d.ok("ui.click", json!({"id": "text.tab.Captions"}));
+    d.frames(3);
+    assert!(d.ids("text.captions.style.backgroundColor").iter().any(|id| id == "text.captions.style.backgroundColor"));
+
+    d.ok("ui.click", json!({"id": "text.captions.style.backgroundOpacity"}));
+    d.ok("ui.type", json!({"text": "40"}));
+    d.ok("ui.key", json!({"key": "Enter"}));
+    d.frames(3);
+    assert_eq!(d.style(track)["backgroundColor"], "#20408066");
+
+    d.ok("ui.click", json!({"id": "text.captions.style.background"}));
+    d.frames(2);
+    let style = d.style(track);
+    assert_eq!(style["background"], false);
+    assert_eq!(style["backgroundColor"], "#20408066");
 }
 
 /// Every text shape on screen, with the colour of its first run.

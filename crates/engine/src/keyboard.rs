@@ -668,6 +668,9 @@ fn export_frame(s: &mut Session, p: &Value) -> Result<Value> {
     if filmcraft_media::pending::take() {
         return Err(EngineError::Other("the frame is still loading; export it again in a moment".into()));
     }
+    if let Some(error) = filmcraft_render::SourceProvider::video_error(&provider) {
+        return Err(EngineError::Other(error));
+    }
     let img = img.ok_or_else(|| bad("file.exportFrame", "cannot decode the Source video frame"))?;
     let (w, h) = (
         u32::try_from(img.w).map_err(|_| bad("file.exportFrame", "image width exceeds limits"))?,

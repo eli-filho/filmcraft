@@ -12,6 +12,7 @@
 
 pub mod aaf_omf;
 pub mod autosave;
+pub mod background;
 pub mod captions;
 pub mod clip_ops;
 pub mod color;
@@ -39,6 +40,9 @@ pub mod narration;
 mod palette;
 pub mod panels;
 pub mod paste_media;
+pub mod pending_import;
+mod pending_import_hydrate;
+mod pending_import_transcript;
 pub mod perf;
 pub mod presets;
 pub mod previews;
@@ -496,6 +500,7 @@ pub struct Session {
     pub mask_jobs: Vec<masks::PendingTrack>,
     /// Scene Edit Detection jobs whose results are applied when they finish.
     pub scene_jobs: Vec<scene_detect::PendingScene>,
+    background_jobs: Vec<background::Pending>,
     /// Effect presets (built-in + the user's, persisted in the data directory).
     pub presets: presets::PresetLibrary,
     /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
@@ -521,6 +526,7 @@ pub struct Session {
     pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
     /// The stamps being taken on a worker thread ([`Session::start_media_scan`]).
     pub media_scan: Option<media_watch::MediaScan>,
+    imports: pending_import::Imports,
 }
 
 /// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
@@ -605,6 +611,7 @@ impl Session {
             media_jobs: Vec::new(),
             mask_jobs: Vec::new(),
             scene_jobs: Vec::new(),
+            background_jobs: Vec::new(),
             presets: Default::default(),
             export_presets: Default::default(),
             export_queue: Default::default(),
@@ -616,6 +623,7 @@ impl Session {
             command_origin: None,
             media_stamps: Default::default(),
             media_scan: None,
+            imports: Default::default(),
         }
     }
 
@@ -652,6 +660,7 @@ impl Session {
     /// ([`Session::recovery_candidates`]).
     pub fn start_autosave(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
         let prefs_path = cfg.data_dir.join("preferences.json");
+        self.media.set_matte_dir(Some(cfg.data_dir.join("Person Mattes")));
         self.prefs = autosave::Preferences::load(&prefs_path);
         // a restart restores the persisted Selection Follows Playhead toggle (#3089)
         self.state.selection_follows_playhead = self.prefs.timeline.selection_follows_playhead;
@@ -700,9 +709,14 @@ impl Session {
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
+        self.poll_imports();
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
+        background::poll(self);
+        if let Some(message) = self.media.take_matte_warning() {
+            self.error_toast("clip.removeBackground", message);
+        }
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
         let Some(p) = self.persistence.as_mut() else { return };
@@ -772,10 +786,17 @@ impl Session {
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        if self.exec_depth == 0 {
+            self.poll_imports();
+        }
         // headless sessions (CLI, MCP, control channel) have no UI frame loop calling
         // `poll_persistence`: apply background mask tracking before each command (#3302)
         if self.exec_depth == 0 && !self.mask_jobs.is_empty() {
             masks::poll(self);
+        }
+        // A Cancel click seen while the job was running wins until its matte is applied.
+        if self.exec_depth == 0 && id != "jobs.cancel" && !self.background_jobs.is_empty() {
+            background::poll(self);
         }
         let journal = spec.journal && !commands::reports_only(id, &params);
         if self.exec_depth == 0 && journal && self.trim_play.active() {
@@ -807,6 +828,9 @@ impl Session {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
         self.exec_depth -= 1;
+        if self.exec_depth == 0 {
+            pending_import::note_placements(self);
+        }
         if outermost {
             self.command_origin = None;
         }
@@ -1116,6 +1140,7 @@ impl Session {
         self.history.redo.push((label.clone(), cur, origin));
         self.fix_state();
         self.bump();
+        self.poll_imports();
         Some(label)
     }
 
@@ -1126,6 +1151,7 @@ impl Session {
         self.history.undo.push((label.clone(), cur, origin));
         self.fix_state();
         self.bump();
+        self.poll_imports();
         Some(label)
     }
 
@@ -1274,6 +1300,9 @@ impl Session {
     pub fn try_render_program_with_offline_at(&self, scale: f32, t: Tick) -> Result<(filmcraft_render::Image, Vec<media_pool::OfflineMedia>)> {
         let provider = self.media.provider(self.project.clone(), self.services.clone()).recording();
         let img = self.render_program_with(scale, t, &provider)?;
+        if let Some(error) = filmcraft_render::SourceProvider::video_error(&provider) {
+            return Err(EngineError::Other(error));
+        }
         Ok((img, provider.offline_used()))
     }
 
@@ -1410,6 +1439,8 @@ mod panels_tests;
 mod par_tests;
 #[cfg(test)]
 mod paste_media_tests;
+#[cfg(test)]
+mod pending_import_tests;
 #[cfg(test)]
 mod place_items_tests;
 #[cfg(test)]

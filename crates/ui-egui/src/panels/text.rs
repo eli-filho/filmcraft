@@ -8,7 +8,7 @@
 //! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands).
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat};
+use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionBackgroundMode, CaptionFormat, CaptionStyle};
 use filmcraft_time::{TimeDisplay, format_time};
 use serde_json::{Value, json};
 
@@ -748,6 +748,69 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
         if resp.changed() {
             actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "background": bg})));
         }
+
+        let [red, green, blue, alpha] = st.background_color;
+        let mut rgb = [red, green, blue];
+        let color = ui.color_edit_button_srgb(&mut rgb).on_hover_text(tl!("Background Color"));
+        app.auto.add("text.captions.style.backgroundColor", color.rect, "Background color");
+
+        let mut opacity = (f32::from(alpha) * 100.0 / 255.0).round();
+        let opacity_response = ui
+            .add(
+                crate::widgets::number_drag(&mut opacity)
+                    .range(0.0..=100.0)
+                    .fixed_decimals(0)
+                    .prefix(format!("{} ", tl!("Opacity")))
+                    .suffix("%")
+                    .update_while_editing(false),
+            )
+            .on_hover_text(tl!("Background Opacity"));
+        app.auto.add("text.captions.style.backgroundOpacity", opacity_response.rect, "Background opacity");
+        let new_alpha = if opacity_response.changed() { (opacity * 255.0 / 100.0).round() as u8 } else { alpha };
+        let [red, green, blue] = if color.changed() { rgb } else { [red, green, blue] };
+        let background_color = [red, green, blue, new_alpha];
+        if background_color != st.background_color {
+            actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "backgroundColor": background_color})));
+        }
+        let per_line = tl!("Per line");
+        let block = tl!("Full block");
+        let label = if st.background_mode == CaptionBackgroundMode::Block { block } else { per_line };
+        let mode = craft_ui::ComboBox::from_id_salt(("caption-background-mode", tr.id.0)).selected_text(label).width(90.0).show_ui(ui, |ui| {
+            for (value, key, label, help) in [
+                (CaptionBackgroundMode::PerLine, "perLine", per_line, tl!("Fit the background to each line of text")),
+                (CaptionBackgroundMode::Block, "block", block, tl!("Fill one rectangle behind all lines of the caption")),
+            ] {
+                let item = ui.selectable_label(st.background_mode == value, label).on_hover_text(help);
+                app.auto.add(&format!("text.captions.style.backgroundMode.{key}"), item.rect.intersect(ui.clip_rect()), label);
+                if item.clicked() {
+                    actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "backgroundMode": key})));
+                }
+            }
+        });
+        let resp = mode.response.on_hover_text(tl!("Background coverage"));
+        app.auto.add("text.captions.style.backgroundMode", resp.rect, "Background coverage");
+        let mut width = 100.0 * st.wrap_width.unwrap_or(CaptionStyle::DEFAULT_WRAP_WIDTH);
+        let resp = ui
+            .add(
+                crate::widgets::number_drag(&mut width)
+                    .range(100.0 * CaptionStyle::MIN_WRAP_WIDTH..=100.0)
+                    .fixed_decimals(0)
+                    .prefix(format!("{} ", tl!("Width")))
+                    .suffix("%")
+                    .update_while_editing(false),
+            )
+            .on_hover_text(tl!("Caption width changes line wrapping while keeping the font size"));
+        app.auto.add("text.captions.style.wrapWidth", resp.rect, "Caption width");
+        if resp.changed() {
+            actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "wrapWidth": width / 100.0})));
+        }
+        if st.wrap_width.is_some() {
+            let resp = ui.small_button(tl!("Reset width")).on_hover_text(tl!("Restore the original caption line breaks and width"));
+            app.auto.add("text.captions.style.wrapWidth.reset", resp.rect, "Reset caption width");
+            if resp.clicked() {
+                actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "wrapWidth": null})));
+            }
+        }
         ui.label(egui::RichText::new(tl!("Align")).size(11.0).color(app.tokens.text_dim));
         for (a, icon_txt, name, tip) in [
             (CaptionAlign::Left, "L", "left", tl!("Align left")),
@@ -766,12 +829,15 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
             (CaptionAnchor::Middle, "middle", tl!("Position: middle")),
             (CaptionAnchor::Bottom, "bottom", tl!("Position: bottom")),
         ] {
-            let resp = ui.selectable_label(st.anchor == a, name[..1].to_uppercase()).on_hover_text(tip);
+            let resp = ui.selectable_label(st.position.is_none() && st.anchor == a, name[..1].to_uppercase()).on_hover_text(tip);
             app.auto.add(&format!("text.captions.style.anchor.{name}"), resp.rect, name);
             if resp.clicked() {
-                actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "anchor": name})));
+                actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "anchor": name, "position": null})));
             }
         }
+        let hint = if st.position.is_some() { tl!("Custom position") } else { tl!("Drag in Program Monitor") };
+        ui.label(egui::RichText::new(hint).size(11.0).color(app.tokens.text_dim))
+            .on_hover_text(tl!("Pause on a caption and drag it in the Program Monitor to move the whole track"));
     });
     child.min_rect().height()
 }

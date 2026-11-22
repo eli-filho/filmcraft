@@ -39,7 +39,9 @@
 //! size and rate match the sequence. Green (a valid preview exists) is decided by the preview
 //! store, which knows which hashes have files.
 
-use filmcraft_project::{ClipId, ItemId, ItemKind, Project, Sequence, TrackItem, TrackKind, Transition};
+use std::collections::HashSet;
+
+use filmcraft_project::{ClipId, ItemId, ItemKind, PersonMatteRef, Project, Sequence, TrackItem, TrackKind, Transition};
 use filmcraft_time::{FrameRate, Tick};
 use serde::Serialize;
 
@@ -88,6 +90,9 @@ pub struct Segment {
     pub cost_ms: f64,
     /// Visible clips (including both sides of transitions), for Render Selection.
     pub clips: Vec<ClipId>,
+    /// Local files that must remain valid before the stored preview can stand in for the render.
+    #[serde(skip)]
+    pub matte_sources: HashSet<(ItemId, PersonMatteRef)>,
 }
 
 impl Segment {
@@ -161,12 +166,13 @@ pub fn video_segments(project: &Project, seq_id: ItemId) -> Vec<Segment> {
         h.json(&seq.settings);
         h.json(&(fb - fa));
         let mut clips = Vec::new();
+        let mut matte_sources = HashSet::new();
         let mut absolute = false;
         for l in &layers {
             match l {
                 Layer::Item(ti, it) => {
                     h.json(&("item", ti));
-                    hash_item(&mut h, project, it, t, TrackKind::Video, 0);
+                    hash_item(&mut h, project, it, t, TrackKind::Video, 0, &mut matte_sources);
                     absolute |= prints_time(it);
                     clips.push(it.id);
                 }
@@ -180,7 +186,7 @@ pub fn video_segments(project: &Project, seq_id: ItemId) -> Vec<Segment> {
                     for side in [a, b] {
                         match side {
                             Some(it) => {
-                                hash_item(&mut h, project, it, t, TrackKind::Video, 0);
+                                hash_item(&mut h, project, it, t, TrackKind::Video, 0, &mut matte_sources);
                                 absolute |= prints_time(it);
                                 clips.push(it.id);
                             }
@@ -202,7 +208,7 @@ pub fn video_segments(project: &Project, seq_id: ItemId) -> Vec<Segment> {
         } else {
             Need::Realtime
         };
-        out.push(Segment { first_frame: fa, frames: fb - fa, start: t, end: rate.tick_of(fb), hash: h.hex(), need, cost_ms, clips });
+        out.push(Segment { first_frame: fa, frames: fb - fa, start: t, end: rate.tick_of(fb), hash: h.hex(), need, cost_ms, clips, matte_sources });
     }
     out
 }
@@ -254,6 +260,7 @@ pub fn audio_segments(project: &Project, seq_id: ItemId) -> Vec<AudioSegment> {
     // submixes (routing, inserts, automation) affect every segment
     global.json(&seq.submix_tracks);
     let mut out = Vec::new();
+    let mut matte_sources = HashSet::new();
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
         if b <= a {
@@ -277,7 +284,7 @@ pub fn audio_segments(project: &Project, seq_id: ItemId) -> Vec<AudioSegment> {
                 for side in [x.from, x.to] {
                     match side.and_then(|id| tr.item(id)).filter(|i| i.enabled) {
                         Some(it) => {
-                            hash_item(&mut h, project, it, t, TrackKind::Audio, 0);
+                            hash_item(&mut h, project, it, t, TrackKind::Audio, 0, &mut matte_sources);
                             heard = true;
                         }
                         None => h.json(&"none"),
@@ -285,7 +292,7 @@ pub fn audio_segments(project: &Project, seq_id: ItemId) -> Vec<AudioSegment> {
                 }
             } else if let Some(it) = tr.item_at(t).filter(|i| i.enabled) {
                 h.json(&("item", ti));
-                hash_item(&mut h, project, it, t, TrackKind::Audio, 0);
+                hash_item(&mut h, project, it, t, TrackKind::Audio, 0, &mut matte_sources);
                 heard = true;
             }
         }
@@ -302,7 +309,15 @@ fn prints_time(it: &TrackItem) -> bool {
 
 /// Hash a clip and its source as heard (`kind` Audio) or seen (`kind` Video): a nested sequence
 /// contributes only the tracks of that kind, so editing its picture keeps its sound's previews.
-fn hash_item(h: &mut Fnv128, project: &Project, it: &TrackItem, origin: Tick, kind: TrackKind, depth: u32) {
+fn hash_item(
+    h: &mut Fnv128,
+    project: &Project,
+    it: &TrackItem,
+    origin: Tick,
+    kind: TrackKind,
+    depth: u32,
+    matte_sources: &mut HashSet<(ItemId, PersonMatteRef)>,
+) {
     let mut c = it.clone();
     c.id = Default::default();
     c.start -= origin;
@@ -313,11 +328,20 @@ fn hash_item(h: &mut Fnv128, project: &Project, it: &TrackItem, origin: Tick, ki
     if !c.effects.iter().any(|e| e.effect == "clip_name") {
         c.name.clear();
     }
+    if kind == TrackKind::Video
+        && it.enabled
+        && let Some(matte) = it.active_person_matte()
+    {
+        matte_sources.insert((it.item, matte.clone()));
+    } else {
+        // Bypass shows the same picture as a clip without a matte. Reuse its preview.
+        c.person_matte = None;
+    }
     h.json(&c);
-    hash_source(h, project, it.item, kind, depth);
+    hash_source(h, project, it.item, kind, depth, matte_sources);
 }
 
-fn hash_source(h: &mut Fnv128, project: &Project, id: ItemId, kind: TrackKind, depth: u32) {
+fn hash_source(h: &mut Fnv128, project: &Project, id: ItemId, kind: TrackKind, depth: u32, matte_sources: &mut HashSet<(ItemId, PersonMatteRef)>) {
     let Some(pi) = project.item(id) else {
         h.json(&"missing");
         return;
@@ -340,7 +364,7 @@ fn hash_source(h: &mut Fnv128, project: &Project, id: ItemId, kind: TrackKind, d
         }
         ItemKind::Subclip { parent, range, .. } => {
             h.json(&("subclip", range));
-            hash_source(h, project, *parent, kind, depth + 1);
+            hash_source(h, project, *parent, kind, depth + 1, matte_sources);
         }
         ItemKind::AdjustmentLayer { .. } => h.json(&("adjustment", &pi.kind)),
         ItemKind::Graphic { .. } => h.json(&("graphic", &pi.kind)),
@@ -352,7 +376,7 @@ fn hash_source(h: &mut Fnv128, project: &Project, id: ItemId, kind: TrackKind, d
                 for (ti, tr) in s.audio_tracks.iter().enumerate() {
                     h.json(&("track", ti, tr.muted, tr.solo, tr.volume_db, tr.pan, tr.channels, &tr.effects, &tr.mixer, tr.items.len()));
                     for it in &tr.items {
-                        hash_item(h, project, it, Tick::ZERO, kind, depth + 1);
+                        hash_item(h, project, it, Tick::ZERO, kind, depth + 1, matte_sources);
                     }
                     for x in &tr.transitions {
                         let mut xc = x.clone();
@@ -367,7 +391,7 @@ fn hash_source(h: &mut Fnv128, project: &Project, id: ItemId, kind: TrackKind, d
             for (ti, tr) in s.video_tracks.iter().enumerate() {
                 h.json(&("track", ti, tr.enabled, tr.items.len()));
                 for it in &tr.items {
-                    hash_item(h, project, it, Tick::ZERO, kind, depth + 1);
+                    hash_item(h, project, it, Tick::ZERO, kind, depth + 1, matte_sources);
                 }
                 for x in &tr.transitions {
                     let mut xc = x.clone();
@@ -490,7 +514,7 @@ fn item_fx_cost(it: &TrackItem, px: f64) -> f64 {
 }
 
 fn cpu_layer(project: &Project, it: &TrackItem) -> bool {
-    let fx = it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)) || it.has_opacity_masks();
+    let fx = it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)) || it.has_opacity_masks() || it.active_person_matte().is_some();
     let blend = crate::opacity_blend(it, it.source_in).1 != crate::Blend::Normal;
     let nested = project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::Sequence(_)));
     fx || blend || nested
@@ -524,7 +548,13 @@ fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer]) -> f64 {
 /// A single clip that plays natively: no standard effects, untouched fixed effects, normal speed,
 /// source frame size and rate equal to the sequence's.
 fn native(project: &Project, seq: &Sequence, it: &TrackItem) -> bool {
-    if it.has_standard_effects() || it.has_modified_intrinsics() || (it.speed - 1.0).abs() > 1e-9 || it.reverse || it.frame_hold.is_some() {
+    if it.has_standard_effects()
+        || it.has_modified_intrinsics()
+        || it.active_person_matte().is_some()
+        || (it.speed - 1.0).abs() > 1e-9
+        || it.reverse
+        || it.frame_hold.is_some()
+    {
         return false;
     }
     match project.item(it.item).map(|p| &p.kind) {

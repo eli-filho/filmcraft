@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::AutomationError;
 
-/// How often a blocking export's app job is polled.
+/// How often a blocking command's app job is polled.
 const JOB_POLL: Duration = Duration::from_millis(250);
 /// Idle connections kept for reuse; the app serves at most 16 at once.
 const MAX_IDLE: usize = 4;
@@ -41,12 +41,10 @@ impl BridgeClient {
         Ok(Self { addr, token: std::env::var("FILMCRAFT_CONTROL_TOKEN").ok(), idle: Mutex::new(Vec::new()), next_id: AtomicU64::new(1) })
     }
 
-    /// Run engine command `id` in the app. A blocking export (`file.exportMedia` with
-    /// `wait: true`, see [`crate::long_job::LONG_COMMANDS`]) is started as an app job and polled
-    /// here until it finishes, so the app keeps repainting (its status bar shows the progress) and
-    /// answering other requests, and no request waits on the control server's 60 s reply limit
-    /// (#91, #92). The reply is the same as a blocking export's: `{job, path, result}`, or the
-    /// export's error.
+    /// Run engine command `id` in the app. A blocking command (`wait: true`, see
+    /// [`crate::long_job::LONG_COMMANDS`]) is started as an app job and polled here until it finishes,
+    /// so the app keeps repainting and answering other requests within the control server's reply
+    /// limit (#91, #92). The reply includes the job's result or reports its error.
     pub async fn execute(&self, id: &str, mut params: Value) -> Result<Value, AutomationError> {
         if !crate::long_job::is_long(id, &params) {
             return self.call("engine.execute", json!({"command": id, "params": params})).await;
@@ -67,7 +65,7 @@ impl BridgeClient {
             }
         };
         if let Some(e) = result.get("error").and_then(Value::as_str) {
-            return Err(AutomationError::App(format!("export failed: {e}")));
+            return Err(AutomationError::App(crate::long_job::failure_message(id, e)));
         }
         if let Some(o) = start.as_object_mut() {
             o.insert("result".into(), result);
@@ -160,6 +158,7 @@ mod tests {
                 log.lock().await.push(req.clone());
                 let reply = match req["params"]["command"].as_str() {
                     Some("file.exportMedia") => json!({"job": 7, "path": "/tmp/out.mov"}),
+                    Some("clip.removeBackground") => json!({"job": 7}),
                     Some("jobs.list") => {
                         polls += 1;
                         let finished = polls >= 3;
@@ -205,6 +204,17 @@ mod tests {
         assert_eq!(seen[0]["params"]["params"]["wait"], json!(false));
         assert!(seen.iter().all(|q| q["params"]["params"]["wait"] != json!(true)));
         assert_eq!(seen.iter().filter(|q| q["params"]["command"] == "file.exportMedia").count(), 1, "started once");
+        assert_eq!(seen.iter().filter(|q| q["params"]["command"] == "jobs.list").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn blocking_background_removal_leaves_the_desktop_thread_free() {
+        let (addr, seen) = fake_app(json!({"frames": 42})).await;
+        let b = BridgeClient::new(addr).unwrap();
+        let result = b.execute("clip.removeBackground", json!({"clip": 8, "wait": true})).await.unwrap();
+        assert_eq!(result, json!({"job": 7, "result": {"frames": 42}}));
+        let seen = seen.lock().await;
+        assert_eq!(seen[0]["params"]["params"], json!({"clip": 8, "wait": false}));
         assert_eq!(seen.iter().filter(|q| q["params"]["command"] == "jobs.list").count(), 3);
     }
 

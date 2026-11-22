@@ -24,9 +24,11 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use filmcraft_frame::{AudioBuffer, VideoFrame};
 use filmcraft_media::generators::GeneratorSource;
+use filmcraft_media::person_matte::MatteReader;
 use filmcraft_media::{FrameRequest, MediaError, MediaInfo, MediaSource, Opener, SharedSource};
-use filmcraft_project::{ItemId, MediaClip, MediaRef, Project};
+use filmcraft_project::{ItemId, MediaClip, MediaRef, PersonMatteRef, Project};
 use filmcraft_render::offline::OfflineReason;
+use filmcraft_time::Tick;
 
 use crate::Services;
 
@@ -57,6 +59,9 @@ pub struct MediaPool {
     use_proxies: AtomicBool,
     /// Per item: video frames that failed in a row in the monitors (see [`Self::monitor_source`]).
     failures: Arc<Mutex<HashMap<ItemId, u32>>>,
+    // One preview warning per source until it is relinked, reanalysed or the project changes.
+    matte_warnings: Mutex<HashMap<ItemId, Option<String>>>,
+    matte_dir: RwLock<Option<PathBuf>>,
     /// Openers tried before the built-in ones (MP4/MOV + codecs register here).
     pub openers: RwLock<Vec<Opener>>,
     /// Media and proxy paths that came from a document, with that document's path (see
@@ -73,6 +78,8 @@ impl Default for MediaPool {
             offline: Arc::new(RwLock::new(HashMap::new())),
             use_proxies: AtomicBool::new(false),
             failures: Arc::default(),
+            matte_warnings: Mutex::default(),
+            matte_dir: RwLock::new(crate::background::cache_dir()),
             openers: RwLock::new(filmcraft_codecs::openers()),
             stored: RwLock::default(),
         }
@@ -181,6 +188,19 @@ impl MediaPool {
         self.sources.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         self.proxies.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
+        self.matte_warnings.lock().unwrap_or_else(PoisonError::into_inner).remove(&item);
+    }
+
+    pub(crate) fn take_matte_warning(&self) -> Option<String> {
+        self.matte_warnings.lock().unwrap_or_else(PoisonError::into_inner).values_mut().find_map(Option::take)
+    }
+
+    pub(crate) fn matte_dir(&self) -> Option<PathBuf> {
+        self.matte_dir.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn set_matte_dir(&self, dir: Option<PathBuf>) {
+        *self.matte_dir.write().unwrap_or_else(PoisonError::into_inner) = dir;
     }
 
     /// Record the media and proxy paths of `p`, loaded from the document at `document` (None: one
@@ -236,8 +256,10 @@ impl MediaPool {
         self.sources.write().unwrap_or_else(PoisonError::into_inner).clear();
         self.proxies.write().unwrap_or_else(PoisonError::into_inner).clear();
         self.offline.write().unwrap_or_else(PoisonError::into_inner).clear();
+        self.matte_warnings.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
 
+    /// Already-open source only: readiness checks must never cause file I/O.
     pub fn cached(&self, item: ItemId) -> Option<SharedSource> {
         self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item).map(|(_, s)| s.clone())
     }
@@ -314,6 +336,18 @@ impl MediaPool {
     fn resolve(&self, p: &Project, item: ItemId, services: &dyn Services, proxies: bool) -> Option<SharedSource> {
         let (item, m, _) = p.resolve_media(item)?;
         let it = p.item(item)?;
+        if let Some(pending) = p.pending_imports.get(&item).filter(|_| !m.offline) {
+            if pending.error.is_some() || !pending.metadata_ready {
+                return Some(Arc::new(crate::pending_import::WaitingSource(m.info.clone(), pending.error.clone())));
+            }
+            if let Some((key, source)) = self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item)
+                && *key == media_key(m)
+            {
+                return Some(source.clone());
+            }
+            // A saved pending clip is resumed by session polling; the UI must not reopen it.
+            return Some(Arc::new(crate::pending_import::WaitingSource(m.info.clone(), None)));
+        }
         if proxies
             && !m.offline
             && let Some(MediaRef::File { path }) = &m.proxy
@@ -372,6 +406,9 @@ impl MediaPool {
     /// the slate and says why, so the job shows what the monitors show).
     pub fn own_source(&self, p: &Project, item: ItemId, services: &dyn Services) -> Option<SharedSource> {
         let (item, m, _) = p.resolve_media(item)?;
+        if p.pending_imports.contains_key(&item) {
+            return None;
+        }
         let MediaRef::File { path } = &m.media else { return None };
         if m.offline || m.info.kind == filmcraft_media::MediaKind::ImageSequence || self.offline_status(item).is_some() {
             return None;
@@ -422,12 +459,12 @@ impl MediaPool {
 
     /// A render-side provider bound to a project snapshot (proxies when enabled).
     pub fn provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None, own: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None, own: None, video_error: Mutex::default() }
     }
 
     /// A provider that always reads full-resolution media (export).
     pub fn full_res_provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None, own: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None, own: None, video_error: Mutex::default() }
     }
 }
 
@@ -442,6 +479,7 @@ pub struct PoolProvider {
     used: Option<Mutex<BTreeSet<ItemId>>>,
     /// Per media item, its own copy or None to share the pool's source ([`PoolProvider::own_sources`]).
     own: Option<Mutex<HashMap<ItemId, Option<SharedSource>>>>,
+    video_error: Mutex<Option<String>>,
 }
 
 impl PoolProvider {
@@ -509,6 +547,35 @@ impl filmcraft_render::SourceProvider for PoolProvider {
         }
         if self.full_res { self.pool.full_res_source(&self.project, item, &*self.services) } else { self.pool.source_for(&self.project, item, &*self.services) }
     }
+
+    fn matte_source(&self, item: ItemId) -> Option<SharedSource> {
+        if self.full_res { self.source(item) } else { self.pool.full_res_source(&self.project, item, &*self.services) }
+    }
+
+    fn person_matte(&self, item: ItemId, reference: &PersonMatteRef) -> Option<MatteReader> {
+        let (_, media, _) = self.project.resolve_media(item)?;
+        let MediaRef::File { path } = &media.media else { return None };
+        let file = self.pool.follow(path).ok()?;
+        crate::background::open_matte(&self.pool.matte_dir()?, &file, reference)
+    }
+
+    fn person_matte_failed(&self, item: ItemId) {
+        let id = self.project.resolve_media(item).map_or(item, |(id, _, _)| id);
+        let message = || {
+            let name = self.project.item(id).map_or("source video", |item| &item.name);
+            format!(
+                "Background matte unavailable for {name}. Choose Clip > Remove Background to analyse the clip’s current range, or Clip > Restore Background to show the original."
+            )
+        };
+        self.video_error.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(message);
+        if self.used.is_none() && self.own.is_none() {
+            self.pool.matte_warnings.lock().unwrap_or_else(PoisonError::into_inner).entry(id).or_insert_with(|| Some(message()));
+        }
+    }
+
+    fn video_error(&self) -> Option<String> {
+        self.video_error.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
 }
 
 /// The offline slate as a media source: video frames are the slate at the requested scale of the
@@ -570,8 +637,17 @@ struct UnsupportedAsSlate {
 }
 
 impl MediaSource for UnsupportedAsSlate {
+    fn readiness(&self) -> filmcraft_media::MediaReadiness {
+        self.inner.readiness()
+    }
     fn info(&self) -> &MediaInfo {
         self.inner.info()
+    }
+    fn matte_frame_key(&self, time: Tick) -> Option<i64> {
+        self.inner.matte_frame_key(time)
+    }
+    fn matte_frame(&self, key: i64) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        self.inner.matte_frame(key)
     }
     fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
         match self.inner.video_frame(req) {
@@ -618,6 +694,9 @@ struct DamagedAsSlate {
 }
 
 impl MediaSource for DamagedAsSlate {
+    fn readiness(&self) -> filmcraft_media::MediaReadiness {
+        self.inner.readiness()
+    }
     fn info(&self) -> &MediaInfo {
         self.inner.info()
     }

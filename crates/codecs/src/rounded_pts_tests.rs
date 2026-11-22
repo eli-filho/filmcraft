@@ -14,7 +14,7 @@ use filmcraft_frame::{PixelData, VideoFrame};
 use filmcraft_isobmff::{Brand, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
 use filmcraft_matroska::{MkvWriter, MuxOptions, TrackKind, TrackSpec};
 use filmcraft_media::{FrameRequest, MediaSource};
-use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 
 /// Bits of the frame index drawn per picture, one `BLOCK`-pixel square each.
 const BITS: u32 = 8;
@@ -179,8 +179,14 @@ fn mp4_90k(durations: &[u32]) -> Arc<[u8]> {
 
 /// An MP4 at timescale `ts` with the given sample durations.
 fn mp4_durations(ts: u32, durations: &[u32]) -> Arc<[u8]> {
+    mp4_durations_from(ts, durations, None)
+}
+
+fn mp4_durations_from(ts: u32, durations: &[u32], media_start: Option<i64>) -> Arc<[u8]> {
     let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
-    let t = w.add_track(TrackConfig::new(SampleEntry::jpeg((BITS * BLOCK) as u16, BLOCK as u16), ts)).unwrap();
+    let mut config = TrackConfig::new(SampleEntry::jpeg((BITS * BLOCK) as u16, BLOCK as u16), ts);
+    config.media_start = media_start;
+    let t = w.add_track(config).unwrap();
     for (k, &duration) in durations.iter().enumerate() {
         w.write_sample(t, WriteSample { data: &picture(k), duration, composition_offset: 0, is_sync: true }).unwrap();
     }
@@ -270,6 +276,56 @@ fn mp4_variable_rate_and_on_grid_frame_times_stay_put() {
         }
     }
     assert!(failures.is_empty(), "{}", failures[..failures.len().min(8)].join("\n"));
+}
+
+#[test]
+fn matte_keys_include_short_off_grid_frames_and_decode_the_matching_picture() {
+    let durations = [3000, 3000, 600, 5400, 3000];
+    let source = crate::open_bytes("matte.mov", mp4_90k(&durations)).unwrap();
+    assert!(source.matte_frame_keys(4).is_err());
+    let keys = source.matte_frame_keys(5).unwrap();
+    assert_eq!(keys, [0, 3000, 6000, 6600, 12000]);
+    for (i, &key) in keys.iter().enumerate() {
+        let time = Tick::from_rational(key, 1, 90_000);
+        assert_eq!(source.matte_frame_key(time), Some(key));
+        assert_eq!(index_of(&source.matte_frame(key).unwrap()), i);
+    }
+}
+
+#[test]
+fn matte_keys_in_range_keep_vfr_straddles_and_exclude_the_out_point() {
+    let source = crate::open_bytes("matte.mov", mp4_90k(&[3000, 3000, 600, 5400, 3000])).unwrap();
+    let at = |pts| Tick::from_rational(pts, 1, 90_000);
+    let range = TimeRange::from_bounds(at(3300), at(12_000));
+    assert!(source.matte_frame_keys_in_range(range, 2).is_err());
+    assert_eq!(source.matte_frame_keys_in_range(range, 3).unwrap(), [3000, 6000, 6600]);
+    let one = TimeRange::from_bounds(at(3300), at(6000));
+    assert_eq!(source.matte_frame_keys_in_range(one, 1).unwrap(), [3000]);
+}
+
+#[test]
+fn matte_keys_in_range_use_edit_adjusted_times_and_keep_original_keys() {
+    let source = crate::open_bytes("edited.mov", mp4_durations_from(90_000, &[3000; 8], Some(3000))).unwrap();
+    let rate = FrameRate::FPS_30;
+    let range = TimeRange::from_bounds(rate.tick_of(2), rate.tick_of(6));
+    let keys = source.matte_frame_keys_in_range(range, 4).unwrap();
+    assert_eq!(keys, [9000, 12_000, 15_000, 18_000]);
+    for (timeline_frame, key) in (2..6).zip(keys) {
+        assert_eq!(source.matte_frame_key(rate.tick_of(timeline_frame)), Some(key));
+        assert_eq!(index_of(&source.matte_frame(key).unwrap()), timeline_frame as usize + 1);
+    }
+}
+
+#[test]
+fn matte_keys_in_range_do_not_round_the_exclusive_end_into_the_next_sample() {
+    let source = crate::open_bytes("coarse.mov", mp4_1ms(FrameRate::FPS_30, Stamp::Nearest)).unwrap();
+    let ms = |units| Tick::from_rational(units, 1, 1000);
+    let end = ms(67);
+    assert_eq!(source.matte_frame_key(end - Tick(1)), Some(67));
+    let range = TimeRange::from_bounds(ms(40), end);
+    assert_eq!(source.matte_frame_keys_in_range(range, 1).unwrap(), [33]);
+    let before_start = TimeRange::from_bounds(ms(-20), ms(-5));
+    assert_eq!(source.matte_frame_keys_in_range(before_start, 1).unwrap(), [0]);
 }
 
 /// Asks for every frame at its start, its middle and nine tenths in, expects that frame each time.

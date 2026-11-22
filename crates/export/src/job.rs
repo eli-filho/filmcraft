@@ -560,6 +560,9 @@ impl Exporter {
                 }
             }
         };
+        if let Some(error) = sources.video_error() {
+            return Err(ExportError::Render(error));
+        }
         let end = f.saturating_add(i64::try_from(frames.len()).unwrap_or(0));
         if end <= f {
             return Err(ExportError::Encode("internal: an empty batch was rendered".into()));

@@ -109,6 +109,125 @@ fn demo() -> Session {
     s
 }
 
+#[derive(Default)]
+struct ImportExportFiles(std::sync::Mutex<Vec<String>>);
+
+impl crate::Services for ImportExportFiles {
+    fn read_file(&self, _: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+    fn write_file(&self, path: &str, _: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().push(path.to_owned());
+        Ok(())
+    }
+    fn export_in_memory(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn pending_or_failed_export_dependencies_write_neither_output_nor_sidecars() {
+    use filmcraft_project::{CaptionFormat, CaptionTrack, PendingImport, TrackId};
+    use filmcraft_time::{TICKS_PER_SECOND, Tick, TimeRange};
+    use std::sync::Arc;
+
+    for error in [None, Some("damaged media header".to_string())] {
+        let mut s = demo();
+        let files = Arc::new(ImportExportFiles::default());
+        s.services = files.clone();
+        let sequence = s.state.active_sequence.unwrap();
+        let media = s.active_sequence().unwrap().audio_tracks.iter().flat_map(|track| &track.items).next().unwrap().item;
+        let project = Arc::make_mut(&mut s.project);
+        let caption_track = TrackId(project.alloc_id());
+        project.sequence_mut(sequence).unwrap().caption_tracks.push(CaptionTrack::new(caption_track, "Captions".into(), CaptionFormat::Subtitle));
+        project.pending_imports.insert(
+            media,
+            PendingImport {
+                ticket: 1,
+                batch: 1,
+                path: "pending.wav".into(),
+                provisional_duration: Tick(TICKS_PER_SECOND),
+                scaling: String::new(),
+                placements: Default::default(),
+                metadata_ready: false,
+                error: error.clone(),
+            },
+        );
+        let settings = filmcraft_export::ExportSettings {
+            path: "rejected.wav".into(),
+            format: filmcraft_export::Format::Wav,
+            range: Some(TimeRange::new(Tick::ZERO, Tick(TICKS_PER_SECOND / 4))),
+            caption_sidecar: Some("srt".into()),
+            ..Default::default()
+        };
+        let snapshot = s.project.clone();
+        let result = crate::export_tools::spawn_export(&mut s, snapshot, sequence, settings, "Pending export".into(), true);
+        let why = result.unwrap_err().to_string();
+        assert!(why.contains("pending.wav"), "{why}");
+        if let Some(error) = error {
+            assert!(why.contains(&error), "{why}");
+        }
+        assert!(s.jobs.is_empty(), "reject before starting an export job");
+        assert!(files.0.lock().unwrap().is_empty(), "neither WAV nor subtitle sidecar is written");
+    }
+}
+
+#[test]
+fn unrelated_pending_bin_media_does_not_block_export() {
+    export_with_unrelated_pending_media(false);
+}
+
+#[test]
+fn pending_media_outside_selected_export_range_does_not_block_export() {
+    export_with_unrelated_pending_media(true);
+}
+
+fn export_with_unrelated_pending_media(place_later: bool) {
+    use filmcraft_project::PendingImport;
+    use filmcraft_time::{TICKS_PER_SECOND, Tick, TimeRange};
+    use std::sync::Arc;
+
+    let mut s = demo();
+    let files = Arc::new(ImportExportFiles::default());
+    s.services = files.clone();
+    let sequence = s.state.active_sequence.unwrap();
+    let source = s.active_sequence().unwrap().audio_tracks.iter().flat_map(|track| &track.items).next().unwrap().clone();
+    let template = s.project.item(source.item).unwrap().clone();
+    let project = Arc::make_mut(&mut s.project);
+    let unrelated = project.add_item("Unused pending media", template.label, template.kind, None);
+    if place_later {
+        let mut clip = source;
+        clip.id = filmcraft_project::ClipId(project.alloc_id());
+        clip.item = unrelated;
+        clip.start = Tick(100 * TICKS_PER_SECOND);
+        project.sequence_mut(sequence).unwrap().audio_tracks[0].items.push(clip);
+    }
+    project.pending_imports.insert(
+        unrelated,
+        PendingImport {
+            ticket: 1,
+            batch: 1,
+            path: "unrelated.wav".into(),
+            provisional_duration: Tick(TICKS_PER_SECOND),
+            scaling: String::new(),
+            placements: Default::default(),
+            metadata_ready: false,
+            error: None,
+        },
+    );
+    let settings = filmcraft_export::ExportSettings {
+        path: "ready.wav".into(),
+        format: filmcraft_export::Format::Wav,
+        range: Some(TimeRange::new(Tick::ZERO, Tick(TICKS_PER_SECOND / 4))),
+        ..Default::default()
+    };
+    let snapshot = s.project.clone();
+    let id = crate::export_tools::spawn_export(&mut s, snapshot, sequence, settings, "Ready export".into(), true).unwrap();
+    let job = s.jobs.iter().find(|job| job.id == id).unwrap();
+    assert!(job.result.lock().unwrap().as_ref().unwrap().is_ok());
+    assert_eq!(*files.0.lock().unwrap(), ["ready.wav"]);
+}
+
 #[test]
 fn single_frame_in_out_warning_follows_the_selected_range() {
     let mut s = demo();

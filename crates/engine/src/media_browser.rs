@@ -532,6 +532,10 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let seq = bool_p(p, "imageSequence").unwrap_or(s.prefs.media_browser.import_as_image_sequence);
     let bin = u64_p(p, "bin");
+    // A plain media drop must not list/stat a path on the UI thread before accepting it.
+    if bool_p(p, "background").unwrap_or(false) && !seq && crate::pending_import::eligible(&paths) {
+        return s.execute("file.import", json!({"paths": paths, "bin": bin, "background": true, "imageSequence": false}));
+    }
     let mut files = Vec::new();
     let mut folders = Vec::new();
     let mut empty = Vec::new();
@@ -792,7 +796,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             r#"{"fileTypes":"all|video|audio|image|project|caption|<ext>"?,"view":"list|thumbnails"?,"columns":[str]?,"columnWidths":{str:f32}?,"importAsImageSequence":bool?,"hoverScrub":bool?,"thumbnailSize":f32?}"#,
             settings,
         ),
-        c("mediaBrowser.import", "Import", r#"{"paths":[str]?,"bin":binId?,"imageSequence":bool?}"#, import),
+        c("mediaBrowser.import", "Import", r#"{"paths":[str]?,"bin":binId?,"imageSequence":bool?,"background":bool?}"#, import),
         CommandSpec {
             id: "mediaBrowser.openInSource",
             label: "Open In Source Monitor",

@@ -717,6 +717,26 @@ fn replace_with_clip_from_source_match_frame_and_bin() {
     assert!(s.execute("clip.replaceFromBin", json!({"item": music.0})).is_err());
 }
 
+#[test]
+fn replace_with_different_media_detaches_the_original_person_matte() {
+    let mut s = demo();
+    let c = v1(&s)[3].clone();
+    let replacement = [item_named(&s, "Misty_Forest.mp4"), item_named(&s, "Desert_Dunes.mp4")].into_iter().find(|&id| id != c.item).unwrap();
+    let matte =
+        filmcraft_project::PersonMatteRef { cache_id: "fixture".into(), source: filmcraft_project::MediaIdentity { size: 1, fingerprint: 2 }, bypassed: false };
+    s.edit_sequence("Test matte", |q, _, _| {
+        q.find_item_mut(c.id).unwrap().1.person_matte = Some(matte.clone());
+        Ok(())
+    })
+    .unwrap();
+    s.execute("clip.replaceFromBin", json!({"clips": [c.id.0], "item": c.item.0})).unwrap();
+    assert_eq!(clip(&s, c.id.0).person_matte.as_ref(), Some(&matte));
+    s.execute("clip.replaceFromBin", json!({"clips": [c.id.0], "item": replacement.0})).unwrap();
+    assert!(clip(&s, c.id.0).person_matte.is_none());
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(clip(&s, c.id.0).person_matte.as_ref(), Some(&matte));
+}
+
 /// Match Frame on a reversed clip maps the Source monitor frame through reverse playback, not as
 /// if the clip still ran forward (source 50 at sequence 20 used to become source 69).
 #[test]

@@ -112,6 +112,7 @@ impl FilmcraftApp {
         }
         self.source_playback.clock.playing = false;
         self.source_playback.clock.audio_clock = false;
+        self.source_playback.clock.preroll = None;
         self.source_playback.clock.meter.finish();
         self.frames.stop_prefetch();
         if let Some(audio) = self.audio.as_mut() {
@@ -129,6 +130,11 @@ impl FilmcraftApp {
             return;
         }
         let Some(item) = self.source_playback.item else { return };
+        if self.session.import_status_at(item, self.session.state.source_playhead).is_some_and(|status| !status.ready) {
+            self.source_playback.clock.preroll = Some(-1.0);
+            self.source_playback.clock.audio_retry_at = 0.0;
+            return;
+        }
         let Some(view) = source_view(&self.session, item) else { return };
         let Some(audio) = self.audio.as_mut() else { return };
 
@@ -169,6 +175,7 @@ impl FilmcraftApp {
                         return;
                     }
                     let frames = (buf.len() / ch).min(usize::try_from(end.saturating_sub(cursor)).unwrap_or(0));
+                    let _ = filmcraft_media::pending::take();
                     match source.audio(cursor, frames, sr) {
                         Ok(mut sound) => {
                             if !channels.is_empty() {
@@ -179,6 +186,9 @@ impl FilmcraftApp {
                             let right = sound.channels.get(1).unwrap_or(left);
                             filmcraft_engine::settings::map_output(left, right, buf, ch, map);
                         }
+                        // Mix-ahead can reach beyond a progressively available prefix before the
+                        // playhead does. Temporary loading is not a fatal decoding failure.
+                        Err(_) if filmcraft_media::pending::take() => {}
                         Err(e) => {
                             *failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!("Source audio decoding failed: {e}"));
                         }
@@ -259,7 +269,31 @@ impl FilmcraftApp {
         }
         let now = self.now();
         let time = self.session.state.source_playhead;
-        if time != self.source_playback.shown {
+        if let Some(status) = item.and_then(|item| self.session.import_status_at(item, time))
+            && !status.ready
+        {
+            if let Some(error) = status.error {
+                self.stop_source();
+                self.ui.status = error;
+                return;
+            }
+            if self.source_playback.clock.audio_clock
+                && let Some(audio) = self.audio.as_mut()
+            {
+                audio.stop();
+            }
+            let clock = &mut self.source_playback.clock;
+            clock.audio_clock = false;
+            clock.audio_retry_at = 0.0;
+            clock.anchor_tick = time;
+            clock.anchor_time = now;
+            clock.preroll = Some(-1.0);
+            self.source_playback.shown = time;
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let was_waiting = self.source_playback.clock.preroll.take().is_some();
+        if was_waiting || time != self.source_playback.shown {
             self.source_playback.clock.anchor_tick = time;
             self.source_playback.clock.anchor_time = now;
             self.source_playback.clock.audio_seen = (0, now);

@@ -2,6 +2,8 @@
 //! Premiere, then standard effects), generated from parameter schemas, with stopwatches and a
 //! keyframe lane on the right. Also hosts the Color Grading panel body (same editor, grouped).
 
+use std::sync::atomic::Ordering;
+
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use filmcraft_project::{ClipId, EffectInstance, ParamKind, ParamValue, TrackItem, TrackKind};
 use filmcraft_time::Tick;
@@ -179,6 +181,46 @@ fn drop_effect(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, clips: &[(
     crate::panels::clear_drag(ui);
 }
 
+/// The selected clip's one-click cutout action, running analysis, or cutout bypass.
+fn background_controls(app: &mut FilmcraftApp, ui: &mut egui::Ui, it: &TrackItem, row: Rect, actions: &mut Vec<(String, Value)>) -> f32 {
+    let control = Rect::from_min_max(pos2(row.max.x - 168.0, row.min.y), pos2(row.max.x - 28.0, row.max.y));
+    let job = app.session.state.active_sequence.and_then(|seq| filmcraft_engine::background::job_for_clip(&app.session, seq, it.id));
+    if let Some(job) = job {
+        let done = job.progress.done.load(Ordering::Relaxed);
+        let total = job.progress.total.load(Ordering::Relaxed);
+        let percent = done.saturating_mul(100).checked_div(total).unwrap_or_default().min(99);
+        let label = format!("{percent}%");
+        let mut child =
+            ui.new_child(egui::UiBuilder::new().max_rect(control).id_salt("background-progress").layout(egui::Layout::right_to_left(egui::Align::Center)));
+        let cancel = tl!("Cancel");
+        let response = child.add_enabled(!job.progress.cancel.load(Ordering::Relaxed), egui::Button::new(cancel));
+        app.auto.add_response("effectControls.opacity.cancelBackgroundRemoval", &response, cancel);
+        let progress = child.label(&label);
+        app.auto.add("effectControls.opacity.backgroundProgress", progress.rect, &label);
+        if response.clicked() {
+            actions.push(("jobs.cancel".into(), json!({"job": job.id})));
+        }
+    } else if let Some(matte) = it.person_matte.as_ref().filter(|_| app.session.is_enabled("clip.toggleBackgroundRemoval")) {
+        let mut enabled = !matte.bypassed;
+        let label = tl!("Background Removal");
+        let response = ui.place(control, egui::Checkbox::new(&mut enabled, label));
+        app.auto.add_response("effectControls.opacity.toggleBackgroundRemoval", &response, label);
+        if response.changed() {
+            actions.push(("clip.toggleBackgroundRemoval".into(), json!({})));
+        }
+    } else if app.session.is_enabled("clip.removeBackground") {
+        let label = tl!("Remove Background");
+        let response = ui.place(control, egui::Button::new(label).truncate().min_size(vec2(0.0, ROW_H)));
+        app.auto.add_response("effectControls.opacity.removeBackground", &response, label);
+        if response.clicked() {
+            actions.push(("clip.removeBackground".into(), json!({})));
+        }
+    } else {
+        return row.max.x - 26.0;
+    }
+    control.min.x - 4.0
+}
+
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let clips = selected_clips(app);
@@ -313,10 +355,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if fxresp.clicked() {
                     actions.push(("effects.toggleEnabled".into(), json!({"clip": clip.0, "index": idx})));
                 }
-                // (the reset button sits at the row's right end)
-                row_label(bui, pos2(r.min.x + 42.0, r.center().y), crate::i18n::t(def.name), r.max.x - 26.0 - (r.min.x + 42.0), Tokens::ui(12.0), t.text);
                 // reset button
                 let rr = Rect::from_center_size(pos2(r.max.x - 14.0, r.center().y), vec2(16.0, 16.0));
+                let label_right = if e.effect == "opacity" { background_controls(app, bui, it, r, &mut actions) } else { r.max.x - 26.0 };
+                let label_left = r.min.x + 42.0;
+                row_label(bui, pos2(label_left, r.center().y), crate::i18n::t(def.name), label_right - label_left, Tokens::ui(12.0), t.text);
                 let rresp = bui.interact(rr, egui::Id::unique(("fxreset", clip.0, idx)), Sense::click()).on_hover_text(tl!("Reset Effect"));
                 icons::paint(bui.painter(), rr.shrink(2.0), Icon::Reset, if rresp.hovered() { t.text } else { t.text_dim });
                 if rresp.clicked() {

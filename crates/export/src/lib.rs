@@ -93,6 +93,8 @@ pub enum ExportError {
     Io(String),
     #[error("encode: {0}")]
     Encode(String),
+    #[error("render: {0}")]
+    Render(String),
     #[error("cancelled")]
     Cancelled,
 }

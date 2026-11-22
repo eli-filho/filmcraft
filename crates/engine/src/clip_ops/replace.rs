@@ -46,6 +46,9 @@ pub(super) fn replace_with(s: &mut Session, p: &Value, how: Replace) -> Result<V
     let ph = s.playhead();
     let targets = with_links(s, &clips_p(s, p));
     let src_channels = pi.as_media().and_then(|m| m.interpret.audio_channels.as_ref()).and_then(|a| a.clips.first().cloned()).unwrap_or_default();
+    let project = s.project.clone();
+    let original = |id| project.resolve_media(id).map(|(_, media, _)| &media.media);
+    let replacement = original(new_item);
     let (replaced, clamped) = s.edit_sequence("Replace With Clip", |q, _, _| {
         let (mut out, mut clamped) = (Vec::new(), Vec::new());
         for c in &targets {
@@ -69,6 +72,9 @@ pub(super) fn replace_with(s: &mut Session, p: &Value, how: Replace) -> Result<V
             };
             if src_in < Tick::ZERO {
                 return Err(EngineError::Other("not enough media before the Source monitor playhead to match the frame".into()));
+            }
+            if it.person_matte.is_some() && original(it.item) != replacement {
+                it.person_matte = None;
             }
             it.item = new_item;
             it.name = pi.name.clone();

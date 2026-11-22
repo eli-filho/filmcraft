@@ -70,6 +70,28 @@ pub enum CaptionAnchor {
     Bottom,
 }
 
+/// The requested center of a caption block, in fractions of the frame from its upper-left corner.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaptionPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// How a caption's background is drawn across its lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptionBackgroundMode {
+    #[default]
+    PerLine,
+    Block,
+}
+
+impl CaptionBackgroundMode {
+    fn is_per_line(&self) -> bool {
+        *self == Self::PerLine
+    }
+}
+
 /// Track-level caption style (Premiere's caption track style / Essential Graphics text settings).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,12 +102,20 @@ pub struct CaptionStyle {
     pub size: f32,
     /// Text colour, sRGB + alpha.
     pub color: [u8; 4],
-    /// Draw a background box behind each line.
+    /// Draw a background behind the text.
     pub background: bool,
     /// Background box colour, sRGB + alpha.
     pub background_color: [u8; 4],
+    #[serde(skip_serializing_if = "CaptionBackgroundMode::is_per_line")]
+    pub background_mode: CaptionBackgroundMode,
     pub align: CaptionAlign,
     pub anchor: CaptionAnchor,
+    /// Free placement. `None` places the block using its alignment, anchor and cue settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<CaptionPosition>,
+    /// Maximum visual caption width as a fraction of the frame, including padding and outline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_width: Option<f32>,
     /// Distance from the anchored frame edge, as a fraction of the frame height.
     pub margin: f32,
     /// Line height as a multiple of the font size.
@@ -98,6 +128,11 @@ pub struct CaptionStyle {
     pub font_style: String,
 }
 
+impl CaptionStyle {
+    pub const DEFAULT_WRAP_WIDTH: f32 = 0.9;
+    pub const MIN_WRAP_WIDTH: f32 = 0.1;
+}
+
 impl Default for CaptionStyle {
     fn default() -> Self {
         Self {
@@ -106,8 +141,11 @@ impl Default for CaptionStyle {
             color: [255, 255, 255, 255],
             background: true,
             background_color: [0, 0, 0, 191],
+            background_mode: CaptionBackgroundMode::default(),
             align: CaptionAlign::Center,
             anchor: CaptionAnchor::Bottom,
+            position: None,
+            wrap_width: None,
             margin: 0.08,
             line_spacing: 1.25,
             outline: 0.0,

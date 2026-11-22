@@ -539,6 +539,20 @@ impl PreviewStore {
             let p = video.get(&seg.hash)?.iter().find(|p| p.off <= rel && rel < p.off.saturating_add(p.len))?;
             (p.name.clone(), p.off)
         };
+        // A saved render can outlive its original video or matte cache. Let the live renderer
+        // handle the missing matte and report it instead of showing the old cutout.
+        if !seg.matte_sources.is_empty() {
+            let dir = pool.matte_dir()?;
+            for (item, reference) in &seg.matte_sources {
+                let (_, media, _) = project.resolve_media(*item)?;
+                let filmcraft_project::MediaRef::File { path } = &media.media else { return None };
+                if media.offline || media.identity != Some(reference.source) {
+                    return None;
+                }
+                let file = pool.follow(path).ok()?;
+                crate::background::open_matte(&dir, &file, reference)?;
+            }
+        }
         let src = self.open(pool, &name)?;
         let rate = project.sequence(seq)?.settings.frame_rate;
         src.video_frame(FrameRequest { time: rate.tick_of(rel - off), scale }).ok()
@@ -675,7 +689,7 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
     let project = s.project.clone();
     // Previews are cached by content and reused with proxies on or off: always full resolution,
     // from their own copies of the files so the monitors keep their decoders.
-    let provider = s.media.full_res_provider(project.clone(), s.services.clone()).own_sources();
+    let provider = s.media.full_res_provider(project.clone(), s.services.clone()).own_sources().recording();
     let (prog, res) = (job.progress.clone(), job.result.clone());
     let nseg = todo.len();
     let run = move || {

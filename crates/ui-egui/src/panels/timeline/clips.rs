@@ -214,6 +214,8 @@ pub(super) fn draw_clip(
     p.line_segment([pos2(body.min.x, body.min.y + 0.5), pos2(body.max.x, body.min.y + 0.5)], Stroke::new(1.0, lighten(fill, 0.15)));
     let name_h = 16.0;
     let w = body.width();
+    let import = app.session.import_status(it.item);
+    let ready = import.as_ref().is_none_or(|status| status.ready);
     // video thumbnails, aspect-correct, below the name band: the head frame, head and tail, or
     // frames side by side across the clip (Show Video Thumbnails in the wrench menu)
     if kind == TrackKind::Video && app.ui.timeline.show_thumbnails && body.height() > 28.0 && w > 20.0 && it.enabled {
@@ -250,10 +252,32 @@ pub(super) fn draw_clip(
         }
     }
     // waveform (audio): rectified, lower 40 %
-    if kind == TrackKind::Audio && app.ui.timeline.show_waveforms && w > 3.0 {
+    if ready && kind == TrackKind::Audio && app.ui.timeline.show_waveforms && w > 3.0 {
         draw_waveform(app, p, body, it, Color32::from_rgb(fill.r() / 2, fill.g() / 2, fill.b() / 2));
     }
     let clip_p = p.with_clip_rect(body.shrink2(vec2(1.0, 0.0)).intersect(p.clip_rect()));
+    if let Some(status) = &import {
+        let mut label = status.error.clone().unwrap_or_else(|| crate::panels::import_progress::label(&status.label, status.progress));
+        let provisional = app
+            .session
+            .project
+            .resolve_media(it.item)
+            .and_then(|(item, _, _)| app.session.project.pending_imports.get(&item))
+            .is_some_and(|pending| !pending.metadata_ready);
+        if provisional && status.error.is_none() {
+            label = tlf!("{status} · temporary duration", status = label);
+        }
+        if body.height() > 38.0 && w > 72.0 {
+            clip_p.text(pos2(body.min.x + 6.0, body.max.y - 11.0), Align2::LEFT_CENTER, &label, Tokens::ui(10.0), Color32::WHITE);
+        }
+        let bar = Rect::from_min_max(pos2(body.min.x + 1.0, body.max.y - 4.0), pos2(body.max.x - 1.0, body.max.y - 1.0));
+        let color = if status.error.is_some() { t.render_yellow } else { Color32::WHITE };
+        crate::panels::import_progress::paint(&clip_p, bar, status.error.as_ref().map(|_| 1.0).or(status.progress), color, ctx.input(|i| i.time));
+        app.auto.add(&format!("timeline.clip.{}.import", it.id.0), body.intersect(p.clip_rect()), &label);
+        if status.error.is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
     // name band (View ▸ the wrench menu's Show Video Names / Show Audio Names)
     // a hidden name keeps the multicam angle and the speed, which say something the name does not
     let names = if kind == TrackKind::Video { app.ui.timeline.show_video_names } else { app.ui.timeline.show_audio_names };

@@ -131,6 +131,34 @@ impl Driver {
 }
 
 #[test]
+fn closing_the_last_sequence_does_not_offer_to_replace_the_project_with_a_demo() {
+    let mut d = Driver::new();
+    d.exec("file.newProject", json!({"name": "My unfinished project"}));
+    let sequence = d.new_sequence("My sequence");
+    let before = serde_json::to_value(d.app().session.project.as_ref()).unwrap();
+    let undo_steps = d.app().session.history.undo.len();
+    assert!(d.app().session.is_dirty() && undo_steps > 0);
+
+    d.click(&format!("timeline.tab.{sequence}.close"));
+    assert!(d.app().session.state.active_sequence.is_none());
+    assert!(d.open().is_empty());
+    let [x, y, w, h] = d.rect("panel.Timeline").unwrap();
+    // The empty Timeline used to put a project-replacing demo button here, even with
+    // unsaved sequences in the project. Clicking this space must now leave the work intact.
+    d.ok("ui.click", json!({"x": x + w / 2.0, "y": y + h / 2.0 + 20.0}));
+    d.frames(3);
+    assert!(serde_json::to_value(d.app().session.project.as_ref()).unwrap() == before, "the empty Timeline click must preserve the project");
+    assert_eq!(d.app().session.history.undo.len(), undo_steps);
+    assert!(d.app().session.is_dirty());
+    assert!(d.app().session.state.active_sequence.is_none());
+    assert!(!d.has("timeline.openDemo"));
+
+    d.show(sequence);
+    assert_eq!(d.active(), sequence);
+    assert!(serde_json::to_value(d.app().session.project.as_ref()).unwrap() == before, "the original sequence reopens without changing the project");
+}
+
+#[test]
 fn each_sequence_tab_keeps_its_own_zoom_scroll_and_track_heights() {
     let mut d = Driver::new();
     let main = d.active();

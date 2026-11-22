@@ -30,6 +30,10 @@ pub(crate) fn ask(app: &mut FilmcraftApp, command: &str, params: &Value) -> bool
         return false;
     }
     let Some(item) = clip_of(app, command, params) else { return false };
+    // Provisional metadata is not evidence that a dropped clip mismatches the sequence.
+    if app.session.import_status(item).is_some_and(|status| !status.ready) {
+        return false;
+    }
     if filmcraft_engine::commands::clip_mismatch(&app.session, item).is_none() {
         return false;
     }

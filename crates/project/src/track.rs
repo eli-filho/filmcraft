@@ -127,6 +127,19 @@ pub struct TrackItem {
     /// ([`GraphicMeta`]). Schema v12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphic: Option<Box<GraphicMeta>>,
+    /// Generated coverage for this clip, indexed by its original media's presentation frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_matte: Option<PersonMatteRef>,
+}
+
+/// A local matte cache entry tied to the source from which it was generated. The cache ID is
+/// resolved by the media provider. Project files cannot supply a filesystem path to a matte.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PersonMatteRef {
+    pub cache_id: String,
+    pub source: crate::MediaIdentity,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bypassed: bool,
 }
 
 /// Time interpolation for speed-changed clips (Clip ▸ Video Options ▸ Time Interpolation).
@@ -230,6 +243,9 @@ impl TrackItem {
     /// The Opacity effect has masks (the layer is cut out before Motion).
     pub fn has_opacity_masks(&self) -> bool {
         self.effect("opacity").is_some_and(|e| e.enabled && e.masks.iter().any(|m| m.mode != mask::MaskMode::None))
+    }
+    pub fn active_person_matte(&self) -> Option<&PersonMatteRef> {
+        self.person_matte.as_ref().filter(|matte| !matte.bypassed)
     }
     pub fn has_standard_effects(&self) -> bool {
         self.effects.iter().any(|e| e.def().is_some_and(|d| !d.intrinsic) && !graphic::is_layer(e))

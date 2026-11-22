@@ -264,6 +264,10 @@ impl FilmcraftApp {
         self.frames.set_context(ctx);
         self.frames.pump(std::time::Duration::from_millis(if self.playback.playing { 24 } else { 40 }));
         self.session.poll_persistence();
+        if self.session.imports_running() {
+            // Import completion and progress must reach an idle window without another input event.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         panels::trim_monitor::advance_at(self, now);
         if self.session.trim_play.active() {
             ctx.request_repaint();

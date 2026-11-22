@@ -7,10 +7,13 @@
 
 use serde_json::{Value, json};
 
+pub use filmcraft_captions::burn::{CaptionBounds, caption_bounds};
 use filmcraft_captions::{Document, Format, WriteOptions};
 use filmcraft_edit as edit;
 use filmcraft_edit::Edge;
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId};
+use filmcraft_project::{
+    CaptionAlign, CaptionAnchor, CaptionBackgroundMode, CaptionFormat, CaptionPosition, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId,
+};
 use filmcraft_time::{Tick, TimeDisplay, format_time};
 
 use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, time_p, u64_p};
@@ -251,8 +254,9 @@ fn track_json(s: &Session, t: &CaptionTrack, index: usize) -> Value {
         "syncLock": t.sync_lock,
         "style": {
             "font": t.style.font, "size": t.style.size, "color": hex(t.style.color),
-            "background": t.style.background, "backgroundColor": hex(t.style.background_color),
+            "background": t.style.background, "backgroundColor": hex(t.style.background_color), "backgroundMode": t.style.background_mode,
             "align": format!("{:?}", t.style.align).to_lowercase(), "anchor": format!("{:?}", t.style.anchor).to_lowercase(),
+            "position": t.style.position, "wrapWidth": t.style.wrap_width,
             "margin": t.style.margin, "lineSpacing": t.style.line_spacing, "outline": t.style.outline, "outlineColor": hex(t.style.outline_color),
             "fontStyle": t.style.font_style,
         },
@@ -361,7 +365,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Caption Track Style",
             &[],
             None,
-            r##"{"track":id|"C1","font":str?,"fontStyle":str="SemiBold" (Regular, Medium, Bold…)?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
+            r##"{"track":id|"C1","font":str?,"fontStyle":str="SemiBold" (Regular, Medium, Bold…)?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"backgroundMode":"perLine|block"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"position":{"x":0..1,"y":0..1}|null?,"wrapWidth":0.1..1|null?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
             has_caption_track,
             |s, p| {
                 let tid = track_param(s, p).ok_or_else(|| {
@@ -373,6 +377,36 @@ pub fn commands() -> Vec<CommandSpec> {
                         ),
                     )
                 })?;
+                let position = p
+                    .get("position")
+                    .map(|v| -> Result<_> {
+                        if v.is_null() {
+                            return Ok(None);
+                        }
+                        let (Some(x), Some(y)) = (f64_p(v, "x"), f64_p(v, "y")) else {
+                            return Err(bad("captions.setStyle", "`position` must be an object with numeric `x` and `y` coordinates, or null"));
+                        };
+                        Ok(Some(CaptionPosition { x: x.clamp(0.0, 1.0) as f32, y: y.clamp(0.0, 1.0) as f32 }))
+                    })
+                    .transpose()?;
+                let background_mode = p
+                    .get("backgroundMode")
+                    .map(|v| match v.as_str() {
+                        Some("perLine") => Ok(CaptionBackgroundMode::PerLine),
+                        Some("block") => Ok(CaptionBackgroundMode::Block),
+                        _ => Err(bad("captions.setStyle", "`backgroundMode` must be `perLine` or `block`")),
+                    })
+                    .transpose()?;
+                let wrap_width = p
+                    .get("wrapWidth")
+                    .map(|v| -> Result<_> {
+                        if v.is_null() {
+                            return Ok(None);
+                        }
+                        let width = v.as_f64().ok_or_else(|| bad("captions.setStyle", "`wrapWidth` must be a number from 0.1 to 1, or null"))?;
+                        Ok(Some(width.clamp(f64::from(CaptionStyle::MIN_WRAP_WIDTH), 1.0) as f32))
+                    })
+                    .transpose()?;
                 let p = p.clone();
                 s.edit("Caption Style", |pr, st| {
                     let seq = st.active_sequence.ok_or(EngineError::NoSequence)?;
@@ -380,6 +414,12 @@ pub fn commands() -> Vec<CommandSpec> {
                     let y = &mut t.style;
                     if bool_p(&p, "reset").unwrap_or(false) {
                         *y = CaptionStyle::default();
+                    }
+                    if let Some(pos) = position {
+                        y.position = pos;
+                    }
+                    if let Some(width) = wrap_width {
+                        y.wrap_width = width;
                     }
                     if let Some(v) = str_p(&p, "font") {
                         y.font = v.to_string();
@@ -398,6 +438,9 @@ pub fn commands() -> Vec<CommandSpec> {
                     }
                     if let Some(c) = p.get("backgroundColor").and_then(parse_color) {
                         y.background_color = c;
+                    }
+                    if let Some(mode) = background_mode {
+                        y.background_mode = mode;
                     }
                     if let Some(c) = p.get("outlineColor").and_then(parse_color) {
                         y.outline_color = c;

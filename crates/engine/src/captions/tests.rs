@@ -88,7 +88,29 @@ fn captions_import_edit_export_and_burn_in() {
     let pd = cpu.px.iter().zip(&with.px).filter(|(a, b)| (*a - *b).abs() > 0.02).count();
     assert!(pd < cpu.px.len() / 200, "the GPU plan matches the CPU render ({pd})");
 
-    // save/open keeps caption tracks
+    // Burn-in places the caption in the upper-left quarter of the exported frame.
+    s.execute("captions.setStyle", json!({"position": {"x": 0.25, "y": 0.25}})).unwrap();
+    let mut export = |burn: bool| {
+        let out = s
+            .execute(
+                "file.exportMedia",
+                json!({
+                    "path": dir.join(format!("positioned-{burn}.png")), "format": "png", "scale": 0.25,
+                    "burnCaptions": burn, "gpuRendering": "off", "range": "custom", "startSeconds": 1.0, "endSeconds": 1.05, "wait": true,
+                }),
+            )
+            .unwrap();
+        image::open(out["path"].as_str().unwrap()).unwrap().to_rgba8()
+    };
+    let with = export(true);
+    let without = export(false);
+    let (w, h) = with.dimensions();
+    assert_eq!(without.dimensions(), (w, h));
+    let changed: Vec<_> = with.enumerate_pixels().zip(without.pixels()).filter(|((_, _, a), b)| a != b).map(|((x, y, _), _)| (x, y)).collect();
+    assert!(changed.len() > 25, "caption pixels appear in burn-in");
+    assert!(changed.iter().all(|&(x, y)| x < w / 2 && y < h / 2), "burn-in respects the free position");
+
+    // Save/open keeps caption tracks and the free position.
     let proj = dir.join("cap.fcproj").to_string_lossy().to_string();
     s.execute("file.saveAs", json!({"path": proj})).unwrap();
     let before = s.active_sequence().unwrap().caption_tracks.clone();
@@ -158,6 +180,71 @@ fn caption_list_track_filter_never_falls_back_to_every_track() {
     for sel in [json!(missing), json!("C3"), json!("C0"), json!("nope")] {
         assert!(s.execute("captions.list", json!({"track": sel})).is_err(), "{sel} names no caption track");
     }
+}
+
+#[test]
+fn caption_free_position_is_undoable_and_validated() {
+    let mut s = demo();
+    s.execute("captions.newTrack", json!({})).unwrap();
+    s.execute("captions.setStyle", json!({"track": "C1", "position": {"x": 1.5, "y": 0.25}})).unwrap();
+    let list = s.execute("captions.list", json!({})).unwrap();
+    assert_eq!(list["tracks"][0]["style"]["position"], json!({"x": 1.0, "y": 0.25}));
+
+    let before = s.project.clone();
+    for invalid in [json!({"x": 0.5}), json!([0.25, 0.5]), json!({"x": "0.5", "y": 0.25})] {
+        assert!(s.execute("captions.setStyle", json!({"position": invalid, "reset": true})).is_err());
+        assert_eq!(s.project, before);
+    }
+    let saved_style = serde_json::to_value(&s.active_sequence().unwrap().caption_tracks[0].style).unwrap();
+    let style: filmcraft_project::CaptionStyle = serde_json::from_value(saved_style).unwrap();
+    assert_eq!(style.position, Some(filmcraft_project::CaptionPosition { x: 1.0, y: 0.25 }));
+
+    s.execute("captions.setStyle", json!({"anchor": "top", "position": null})).unwrap();
+    assert!(s.active_sequence().unwrap().caption_tracks[0].style.position.is_none());
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.active_sequence().unwrap().caption_tracks[0].style, style);
+}
+
+#[test]
+fn caption_background_mode_round_trips_through_style_and_resets() {
+    let mut s = demo();
+    s.execute("captions.newTrack", json!({})).unwrap();
+    let list = s.execute("captions.list", json!({})).unwrap();
+    assert_eq!(list["tracks"][0]["style"]["backgroundMode"], "perLine");
+    s.execute("captions.setStyle", json!({"backgroundMode": "block"})).unwrap();
+    let list = s.execute("captions.list", json!({})).unwrap();
+    assert_eq!(list["tracks"][0]["style"]["backgroundMode"], "block");
+
+    let before = s.project.clone();
+    for invalid in [json!("unknown"), json!(true), json!(null)] {
+        assert!(s.execute("captions.setStyle", json!({"backgroundMode": invalid, "reset": true})).is_err());
+        assert_eq!(s.project, before);
+    }
+    let style = &s.active_sequence().unwrap().caption_tracks[0].style;
+    let saved = serde_json::to_value(style).unwrap();
+    assert_eq!(saved["background_mode"], "block");
+    let restored: filmcraft_project::CaptionStyle = serde_json::from_value(saved).unwrap();
+    assert_eq!(&restored, style);
+
+    s.execute("captions.setStyle", json!({"reset": true})).unwrap();
+    let list = s.execute("captions.list", json!({})).unwrap();
+    assert_eq!(list["tracks"][0]["style"]["backgroundMode"], "perLine");
+}
+
+#[test]
+fn caption_wrap_width_preserves_cues_and_can_be_cleared() {
+    let mut s = demo();
+    s.execute("captions.add", json!({"text": "First line\nSecond line"})).unwrap();
+    let before = s.execute("captions.list", json!({})).unwrap();
+    s.execute("captions.setStyle", json!({"wrapWidth": 0.5})).unwrap();
+    let after = s.execute("captions.list", json!({})).unwrap();
+    assert_eq!(after["tracks"][0]["style"]["wrapWidth"], 0.5);
+    assert_eq!(after["tracks"][0]["style"]["size"], before["tracks"][0]["style"]["size"]);
+    assert_eq!(after["tracks"][0]["captions"], before["tracks"][0]["captions"]);
+
+    assert!(s.execute("captions.setStyle", json!({"wrapWidth": "50%"})).is_err());
+    s.execute("captions.setStyle", json!({"wrapWidth": null})).unwrap();
+    assert_eq!(s.execute("captions.list", json!({})).unwrap(), before);
 }
 
 fn caption_spans(s: &Session) -> Vec<(f64, f64, String)> {

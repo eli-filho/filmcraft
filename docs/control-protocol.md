@@ -135,6 +135,19 @@ management commands and dialog ids: offline media and relinking (`media.findMiss
 proxies (`media.createProxies`, `media.attachProxies`, `media.toggleProxies`, `proxies.*`), ingest
 (`project.ingestSettings`) and the Project Manager (`file.projectManager`, `pm.*`).
 
+On desktop, `file.import` and `mediaBrowser.import` accept `background: true` for ordinary media
+files. The result immediately returns editable `items` and `pending: true`; OS file drops use this
+mode. A pending item has a temporary five-second duration until its metadata arrives. Moves, cuts,
+trims and undo remain ordinary timeline edits while bounded workers prepare the media. Completion
+updates an untouched full-source span and preserves edited ranges. Saving retains pending imports
+so opening the project can resume preparation. Failed files stay in the project with an error.
+`media.status` reports `status: "preparing"` and a `preparation` object with `label`, optional
+`progress`, `ready` and optional `error`. `ready` permits playback even while optional ingest or
+transcription continues. Timeline progress uses `timeline.clip.<id>.import`; monitor
+progress uses `program.importProgress` and `source.importProgress`. Supported standalone audio
+can play its prepared beginning while decoding continues; video still needs its container index.
+Folders, explicit image sequences and interchange documents retain their existing import route.
+
 **Moving clips**: `timeline.move {moves: [{clip, track, time}], insert?, linked?, captions?}` → `{moved: [clip ids]}`.
 `time` is ticks or a time object at the sequence rate (`{"seconds": 2}`, `{"frame": 48}`, `{"timecode": "00:00:02:00"}`),
 and an entry without a `clip`, `track` or `time` is refused by its index. With Linked Selection on (the default; `linked` overrides the toggle for one call) the linked

@@ -188,6 +188,9 @@ fn export_here(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, s
                 let end = (f + batch).min(f1);
                 if let Some(enc) = gif.as_mut() {
                     let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources).0).collect();
+                    if let Some(error) = sources.video_error() {
+                        return Err(ExportError::Render(error));
+                    }
                     for (fi, mut rgba) in (f..end).zip(frames) {
                         // GIF89a has one transparent palette index, not partial alpha. Decide
                         // coverage before quantization and keep the straight colour of visible pixels.
@@ -208,15 +211,11 @@ fn export_here(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, s
                     let written: Vec<Result<u64>> = (f..end)
                         .into_par_iter()
                         .map(|fi| {
-                            let data = encode_still_with(
-                                settings.format,
-                                pipe.frame(fi, sources).0,
-                                w,
-                                h,
-                                settings.alpha,
-                                settings.quality,
-                                settings.exr_compression,
-                            )?;
+                            let rgba = pipe.frame(fi, sources).0;
+                            if let Some(error) = sources.video_error() {
+                                return Err(ExportError::Render(error));
+                            }
+                            let data = encode_still_with(settings.format, rgba, w, h, settings.alpha, settings.quality, settings.exr_compression)?;
                             write_output(settings, &pcm::image_sequence_path(&settings.path, (fi - f0) as u64, count), data)
                         })
                         .collect();

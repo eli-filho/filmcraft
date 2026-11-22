@@ -1,8 +1,6 @@
-//! Long exports over MCP (docs/agents.md § Long exports): `file.exportMedia` with `wait: true`
-//! runs as a background engine job; the server reports its progress as MCP
-//! `notifications/progress` (when the request carried a `progressToken`) and stops it on
-//! `notifications/cancelled`, deleting the partial output. The session lock is only held for
-//! short polls, so other requests are answered while the export runs.
+//! Long commands with `wait: true` run as background engine jobs over MCP. The server reports
+//! `notifications/progress` when the request carries a progress token and stops the job on
+//! `notifications/cancelled`. The session lock is held for short polls so other requests can run.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -15,8 +13,8 @@ use serde_json::{Value, json};
 
 use crate::server::FilmcraftMcp;
 
-/// Engine commands that block until a render is written when called with `wait: true`.
-pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
+/// Engine commands that wait for a background job when called with `wait: true`.
+pub const LONG_COMMANDS: &[&str] = &["file.exportMedia", "clip.removeBackground"];
 
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);
@@ -24,6 +22,15 @@ const POLL: Duration = Duration::from_millis(100);
 /// Whether `command_run {id, params}` is a long call this module runs.
 pub fn is_long(id: &str, params: &Value) -> bool {
     LONG_COMMANDS.contains(&id) && params.get("wait").and_then(Value::as_bool) == Some(true)
+}
+
+pub(crate) fn failure_message(id: &str, error: &str) -> String {
+    let operation = match id {
+        "file.exportMedia" => "export",
+        "clip.removeBackground" => "Remove Background",
+        _ => id,
+    };
+    format!("{operation} failed: {error}")
 }
 
 /// Sends `notifications/progress` for one request; progress only ever increases.
@@ -63,7 +70,7 @@ impl FilmcraftMcp {
         let Some(job) = start.get("job").and_then(Value::as_u64) else {
             return CallToolResult::error(vec![Content::text(format!("{id} started no job: {start}"))]);
         };
-        let out = partial_output(&start);
+        let out = (id == "file.exportMedia").then(|| partial_output(&start));
         let mut rep = Reporter { peer: context.peer.clone(), token: context.meta.get_progress_token(), last: 0.0 };
         loop {
             let state = self.job_state(job).await;
@@ -76,7 +83,7 @@ impl FilmcraftMcp {
                 let offline = state.as_ref().and_then(|j| j.get("offlineMedia").cloned());
                 let result = state.map(|j| j["result"].clone()).unwrap_or(Value::Null);
                 if let Some(e) = result.get("error").and_then(Value::as_str) {
-                    return CallToolResult::error(vec![Content::text(format!("export failed: {e}"))]);
+                    return CallToolResult::error(vec![Content::text(failure_message(id, e))]);
                 }
                 let mut out = start;
                 if let Some(o) = out.as_object_mut() {
@@ -92,7 +99,7 @@ impl FilmcraftMcp {
                 _ = tokio::time::sleep(POLL) => {}
             }
         }
-        // Cancelled: stop the encode at the next batch, wait for the worker, delete the partial file.
+        // Wait for cancellation before removing a partial export. Analysis jobs own their caches.
         let _ = self.run("jobs.cancel", json!({"job": job})).await;
         for _ in 0..600 {
             if self.job_state(job).await.is_none_or(|j| j["finished"].as_bool() == Some(true)) {
@@ -100,7 +107,9 @@ impl FilmcraftMcp {
             }
             tokio::time::sleep(POLL).await;
         }
-        remove_partial(&out, started);
+        if let Some(out) = out {
+            remove_partial(&out, started);
+        }
         CallToolResult::error(vec![Content::text("cancelled")])
     }
 

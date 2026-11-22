@@ -32,12 +32,13 @@ impl FilmcraftApp {
         }
     }
 
-    /// Import the dropped files and folders that exist (a folder as a bin of its media, each
+    /// Import dropped files and folders (a folder as a bin of its media, each
     /// sub-folder a bin within it, as in Premiere); with a pointer and Timeline ▸ drop imports to the
     /// timeline, queue the new items for the Timeline drawn in that viewport. A dropped project
     /// file opens instead, as File ▸ Open would (asking first about unsaved changes, #3843).
     fn import_dropped(&mut self, ctx: &egui::Context, dropped: &[egui::DroppedFileHandle], pointer: Option<(egui::Pos2, egui::ViewportId)>) {
-        let paths: Vec<String> = dropped.iter().map(|f| f.path()).filter(|p| p.exists()).map(|p| p.to_string_lossy().to_string()).collect();
+        // The import worker checks existence: even a metadata lookup can block on a network drive.
+        let paths: Vec<String> = dropped.iter().map(|f| f.path().to_string_lossy().to_string()).collect();
         if let Some(project) = paths.iter().find(|p| is_project_file(p)) {
             // one project is open at a time: the rest of the drop is not imported into either
             let _ = crate::menus::invoke(self, ctx, "file.open", json!({"path": project}));
@@ -50,7 +51,10 @@ impl FilmcraftApp {
         // (Premiere's behaviour): `mediaBrowser.import` walks it with the Media Browser's depth and
         // folder budgets. Plain files import exactly as before: `imageSequence: false` keeps
         // `file.import`'s single-file behaviour.
-        let imported = self.session.execute("mediaBrowser.import", json!({"paths": paths, "bin": self.import_bin().0, "imageSequence": false}));
+        let imported = self.session.execute(
+            "mediaBrowser.import",
+            json!({"paths": paths, "bin": self.import_bin().0, "imageSequence": false, "background": cfg!(not(target_arch = "wasm32"))}),
+        );
         // Say why a drop did not fully import (a folder without media, an unsupported file), as the
         // Import dialog does.
         match &imported {

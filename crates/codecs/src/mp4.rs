@@ -4,14 +4,15 @@
 //! (`media_time` = pre-skip), or applied from `dOps` when a file has no edit list; random access
 //! decodes [`crate::audio::OPUS_PRE_ROLL`] of preceding packets first (≥ the 80 ms `roll` distance).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use filmcraft_color::ColorInfo;
 use filmcraft_frame::{AudioBuffer, Region, VideoFrame};
 use filmcraft_isobmff::{ByteSource, CleanAperture, CodecConfig, Mp4File, Sample, TrackKind};
+use filmcraft_media::person_matte::MAX_MATTE_FRAMES;
 use filmcraft_media::{AudioStreamInfo, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo};
-use filmcraft_time::{FrameRate, Tick};
+use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 
 use crate::audio::{PacketDecoder, decode_pcm};
 use crate::gop::{GopCache, VideoSamples};
@@ -503,6 +504,60 @@ impl MediaSource for Mp4Source {
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         let f = self.video_at(req.time.max(Tick::ZERO))?;
         Ok(f)
+    }
+
+    fn matte_frame_keys(&self, limit: usize) -> Result<Vec<i64>, MediaError> {
+        let track = self.vtrack.and_then(|i| self.file.tracks.get(i)).ok_or(MediaError::NoStream("video"))?;
+        if track.samples.len() > limit {
+            return Err(MediaError::Unsupported(format!("Remove Background supports up to {limit} source frames")));
+        }
+        let first = self.matte_frame_key(Tick::ZERO).ok_or(MediaError::NoStream("video frames"))?;
+        let mut keys: Vec<_> = track.samples.iter().map(|s| s.pts).filter(|&pts| pts >= first).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    fn matte_frame_keys_in_range(&self, range: TimeRange, limit: usize) -> Result<Vec<i64>, MediaError> {
+        if range.duration <= Tick::ZERO {
+            return Ok(Vec::new());
+        }
+        let track = self.vtrack.and_then(|i| self.file.tracks.get(i)).ok_or(MediaError::NoStream("video"))?;
+        let start = range.start.max(Tick::ZERO);
+        let first = self.matte_frame_key(start).ok_or(MediaError::NoStream("video frames"))?;
+        let limit = limit.min(MAX_MATTE_FRAMES);
+        let too_many = || MediaError::Unsupported(format!("Remove Background supports up to {limit} source frames"));
+        if limit == 0 {
+            return Err(too_many());
+        }
+        // Compare timestamps in their exact rational timebase. Looking up the end as a frame
+        // request can round across the cut and accidentally include a picture starting there.
+        let timescale = i128::from(track.timescale);
+        let bounds = i128::from(start.0) * timescale..i128::from(range.end().max(Tick::ZERO).0) * timescale;
+        let mut keys = BTreeSet::from([first]);
+        for sample in &track.samples {
+            let presentation = sample.pts.saturating_add(track.edit_offset);
+            if bounds.contains(&(i128::from(presentation) * i128::from(TICKS_PER_SECOND))) {
+                keys.insert(sample.pts);
+                if keys.len() > limit {
+                    return Err(too_many());
+                }
+            }
+        }
+        Ok(keys.into_iter().collect())
+    }
+
+    fn matte_frame(&self, key: i64) -> Result<Arc<VideoFrame>, MediaError> {
+        let ti = self.vtrack.ok_or(MediaError::NoStream("video"))?;
+        let track = self.file.tracks.get(ti).ok_or(MediaError::NoStream("video"))?;
+        Ok(self.video.frame(&Mp4Video { src: self, track: ti }, key.saturating_add(track.edit_offset))?)
+    }
+
+    fn matte_frame_key(&self, time: Tick) -> Option<i64> {
+        let track = self.file.tracks.get(self.vtrack?)?;
+        let rate = self.info.video.as_ref()?.frame_rate;
+        let target = crate::gop::lookup_time(time.max(Tick::ZERO), 1, i64::from(track.timescale), rate, self.snap);
+        Some(track.samples.get(track.sample_at_presentation_time(target.max(0))?)?.pts)
     }
 
     /// The frame as decoded, with the display matrix's rotation left to the caller (#3467). The
